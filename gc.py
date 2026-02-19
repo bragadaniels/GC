@@ -7,9 +7,1257 @@ import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, List, Tuple
 import traceback
 import gc as _gc
+import io
+import textwrap
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from collections import defaultdict as _defaultdict
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm, mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+    HRFlowable,
+    Image,
+    KeepTogether,
+)
+from reportlab.platypus.flowables import Flowable
+from reportlab.pdfgen import canvas as _rlcanvas
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📄  GCReport — Geração de relatório analítico em PDF
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class GCReport:
+    """Gera relatório analítico PDF para uma ou mais corridas GC.
+
+    Fluxo típico
+    ------------
+    >>> rpt = GCReport(analyzer, title="Análise de Terpenóides")
+    >>> rpt.add_run(rt, raw, corrected, baseline, df, label="Amostra A")
+    >>> rpt.add_run(rt2, raw2, corrected2, baseline2, df2, label="Amostra B")
+    >>> rpt.build("relatorio_gc.pdf")
+
+    O relatório inclui:
+    - Capa com metadados
+    - Parâmetros completos do ProcessingMethod
+    - Para cada corrida: cromatograma limpo + tabela completa de picos
+    - Estatísticas globais da corrida
+    - Seção de comparação (se > 1 corrida)
+    - Apêndice com equações, definições e notas de rodapé
+    """
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Paleta corporativa discreta
+    # ─────────────────────────────────────────────────────────────────────────────
+    _COLORS = {
+        "header_bg": colors.HexColor("#1B2A4A"),
+        "header_fg": colors.white,
+        "section_bg": colors.HexColor("#E8EDF4"),
+        "section_fg": colors.HexColor("#1B2A4A"),
+        "row_alt": colors.HexColor("#F4F6FB"),
+        "row_even": colors.white,
+        "border": colors.HexColor("#C5CDD9"),
+        "accent": colors.HexColor("#2E5FA3"),
+        "warn": colors.HexColor("#C0392B"),
+        "ok": colors.HexColor("#1A7A4A"),
+        "footnote": colors.HexColor("#555555"),
+        "eq_bg": colors.HexColor("#F0F4FA"),
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Definições de equações e notas de rodapé
+    # ─────────────────────────────────────────────────────────────────────────────
+    _EQUATIONS = [
+        (
+            "N (EP/Farmacopeia Europeia)",
+            "N = 5.54 × (tR / W½)²",
+            "tR = tempo de retenção do ápice; W½ = largura a meia-altura (50 % da altura máxima)."
+            " Mais robusto para picos assimétricos. Referência: Ph. Eur. 2.2.29.",
+        ),
+        (
+            "N (USP/Farmacopeia Americana)",
+            "N = 16 × (tR / Wbase)²",
+            "Wbase = largura na base (5 % da altura). Fórmula clássica USP; mais sensível a tailing." " Referência: USP <621>.",
+        ),
+        (
+            "Tailing Factor (USP/JP)",
+            "TF = W0.05 / (2 × df)",
+            "W0.05 = largura total a 5 % da altura; df = distância do início ao ápice a 5 % da altura."
+            " Especificação USP: 0.8 ≤ TF ≤ 2.0.",
+        ),
+        (
+            "Asymmetry Factor (EP)",
+            "As = dt / df",
+            "df = distância do início do pico ao ápice a 10 % da altura;"
+            " dt = distância do ápice ao final do pico a 10 % da altura."
+            " Especificação EP: As ≤ 2.0.",
+        ),
+        (
+            "Resolução (USP)",
+            "Rs = 2(tR2 − tR1) / (Wb1 + Wb2)",
+            "tR1, tR2 = tempos de retenção dos picos 1 e 2; Wb1, Wb2 = larguras na base."
+            " Especificação: Rs ≥ 1.5 (resolução de linha de base). Referência: USP <621>.",
+        ),
+        (
+            "Resolução (EP)",
+            "Rs = 1.18 × (tR2 − tR1) / (W½1 + W½2)",
+            "Utiliza larguras a meia-altura; menos sensível a tailing do que a fórmula USP." " Referência: Ph. Eur. 2.2.29.",
+        ),
+        (
+            "Fator de Capacidade / Retenção",
+            "k' = (tR − t0) / t0",
+            "t0 = tempo morto da coluna (hold-up time). Indica quanto mais o analito é retido"
+            " pela fase estacionária em relação à fase móvel. Típico: 1 < k' < 20.",
+        ),
+        (
+            "Seletividade",
+            "alpha = k'(i) / k'(i-1)",
+            "Razão dos fatores de capacidade de dois picos consecutivos. alpha = 1 → sem seletividade;"
+            " alpha > 1 indica separação. Referência: ISO 11095.",
+        ),
+        (
+            "Shape Quality Score (SQS)",
+            "SQS = exp(−max(tau/sigma − 1, 0))",
+            "tau/sigma = razão dos parâmetros EMG (tailing do modelo exponencial-gaussiano)."
+            " SQS = 1.0 → pico Gaussiano ideal; SQS → 0 → tailing severo.",
+        ),
+        (
+            "Chromatographic Quality Index (CQI)",
+            "CQI = (Ns^wN × Rs^wR × TFs^wT × SNRs^wS)^(1/(wN+wR+wT+wS))",
+            "Média geométrica ponderada de quatro sub-scores normalizados [0–1]:"
+            " eficiência (N), resolução (Rs), simetria (TF) e ruído (SNR)."
+            " Os pesos e referências são configuráveis no ProcessingMethod.",
+        ),
+    ]
+
+    _FOOTNOTES = [
+        ("[1] Tempo de retenção (tR)", "Tempo desde a injeção até o ápice do pico, em segundos."),
+        ("[2] Área (u.a.×s)", "Integral trapezoidal da intensidade acima da linha de base virtual no segmento do pico."),
+        ("[3] Área %", "Participação percentual da área do pico em relação à área total integrada."),
+        ("[4] Altura", "Intensidade máxima do pico acima da linha de base local estimada."),
+        ("[5] SNR", "Signal-to-Noise Ratio local: sinal / ruído (σ estimado por diferenças nas regiões adjacentes ao pico)."),
+        ("[6] W½ (s)", "Largura do pico a 50 % da altura máxima, em segundos."),
+        ("[7] Wbase (s)", "Largura do pico a 5 % da altura máxima ≈ largura na base, em segundos."),
+        ("[8] N (EP)", "Número de pratos teóricos pela fórmula EP. Mede a eficiência da coluna cromatográfica."),
+        ("[9] N (USP)", "Número de pratos teóricos pela fórmula USP."),
+        ("[10] TF (USP)", "Tailing Factor USP. Ideal = 1.0; valores > 2.0 ou < 0.8 indicam problema."),
+        ("[11] As (EP)", "Asymmetry Factor EP. Ideal = 1.0; valores > 2.0 indicam tailing excessivo."),
+        ("[12] Rs (USP)", "Resolução USP entre este pico e o anterior. Rs ≥ 1.5 = resolução de linha de base."),
+        ("[13] Rs (EP)", "Resolução EP entre este pico e o anterior, menos sensível a tailing."),
+        ("[14] k'", "Fator de capacidade/retenção. Requer configuração de dead_time_s no método."),
+        ("[15] alpha", "Seletividade entre picos consecutivos. Disponível quando k' está ativo."),
+        ("[16] SQS", "Shape Quality Score: qualidade de forma do pico baseada no modelo EMG [0–1]."),
+        ("[17] CQI", "Chromatographic Quality Index: score composto de qualidade cromatográfica [0–1]."),
+        (
+            "[18] Método",
+            "Algoritmo de integração: EMG = ajuste exponencial-gaussiano; DROP_LINE = separação pelo vale;"
+            " DECONVOLUTION = deconvolução multi-EMG; TANGENT_SKIM = tangente; FORCED = integração manual pelo usuário.",
+        ),
+    ]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Flowable de linha horizontal decorativa
+    # ─────────────────────────────────────────────────────────────────────────────
+    class _Ruled(HRFlowable):
+        def __init__(self, color=None, thickness=0.5, space=4):
+            if color is None:
+                color = GCReport._COLORS["border"]
+            super().__init__(
+                width="100%",
+                thickness=thickness,
+                color=color,
+                spaceAfter=space,
+                spaceBefore=space,
+                lineCap="round",
+            )
+
+    @dataclass
+    class _RunData:
+        rt: np.ndarray
+        raw: np.ndarray
+        corrected: np.ndarray
+        baseline: np.ndarray
+        results_df: pd.DataFrame
+        label: str
+
+    def __init__(
+        self,
+        analyzer: "GCAnalyzer",
+        title: str = "Relatório de Análise Cromatográfica",
+        analyst: str = "",
+        instrument: str = "",
+        lab: str = "",
+        sample_info: str = "",
+    ):
+        self._analyzer = analyzer
+        self.title = title
+        self.analyst = analyst
+        self.instrument = instrument
+        self.lab = lab
+        self.sample_info = sample_info
+        self._runs: list[GCReport._RunData] = []
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Métodos Estáticos de Ajuda (Refatorados)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt(val, decimals=2, fallback="—"):
+        """Formata float com fallback elegante para NaN/None."""
+        try:
+            f = float(val)
+            if not (f == f):  # NaN check idiomático
+                return fallback
+            return f"{f:.{decimals}f}"
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _verdict_color(col_name: str, val) -> Optional[colors.Color]:
+        """Retorna cor de alerta para células fora de especificação."""
+        _C = GCReport._COLORS
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return None
+        limits = {
+            "tailing_factor_usp": (0.8, 1.5),
+            "asymmetry_factor_ep": (0.8, 1.5),
+            "N_plates_ep": (2000, None),
+            "Rs_usp": (1.5, None),
+            "snr": (10.0, None),
+        }
+        lo, hi = limits.get(col_name, (None, None))
+        if lo is not None and v < lo:
+            return _C["warn"]
+        if hi is not None and v > hi:
+            return _C["warn"]
+        return None
+
+    @staticmethod
+    def _build_styles():
+        """Construtor de estilos tipográficos."""
+        _C = GCReport._COLORS
+        base = getSampleStyleSheet()
+
+        def ps(name, parent="Normal", **kw):
+            return ParagraphStyle(name, parent=base[parent], **kw)
+
+        return {
+            "cover_title": ps(
+                "cover_title", "Title", fontSize=28, textColor=_C["header_bg"], leading=34, spaceAfter=6, alignment=TA_CENTER
+            ),
+            "cover_sub": ps(
+                "cover_sub", "Normal", fontSize=13, textColor=_C["accent"], leading=18, spaceAfter=4, alignment=TA_CENTER
+            ),
+            "cover_meta": ps(
+                "cover_meta", "Normal", fontSize=9, textColor=colors.HexColor("#666666"), alignment=TA_CENTER, spaceAfter=2
+            ),
+            "section": ps(
+                "section",
+                "Heading1",
+                fontSize=12,
+                textColor=_C["section_fg"],
+                leading=16,
+                backColor=_C["section_bg"],
+                leftIndent=-4,
+                rightIndent=-4,
+                spaceBefore=14,
+                spaceAfter=6,
+                borderPadding=(4, 6, 4, 6),
+            ),
+            "subsection": ps(
+                "subsection", "Heading2", fontSize=10, textColor=_C["accent"], leading=14, spaceBefore=8, spaceAfter=4
+            ),
+            "body": ps("body", "Normal", fontSize=8.5, leading=12, spaceAfter=3, alignment=TA_JUSTIFY),
+            "th": ps(
+                "th",
+                "Normal",
+                fontSize=7.5,
+                textColor=_C["header_fg"],
+                leading=10,
+                alignment=TA_CENTER,
+                fontName="Helvetica-Bold",
+            ),
+            "td": ps("td", "Normal", fontSize=7.5, leading=10, alignment=TA_CENTER),
+            "td_l": ps("td_l", "Normal", fontSize=7.5, leading=10, alignment=TA_LEFT),
+            "eq": ps(
+                "eq",
+                "Normal",
+                fontSize=8,
+                leading=12,
+                fontName="Courier",
+                backColor=_C["eq_bg"],
+                leftIndent=12,
+                rightIndent=12,
+                spaceBefore=3,
+                spaceAfter=3,
+                borderPadding=4,
+            ),
+            "footnote": ps("footnote", "Normal", fontSize=6.5, textColor=_C["footnote"], leading=9, spaceAfter=1),
+            "caption": ps(
+                "caption", "Normal", fontSize=7.5, textColor=_C["footnote"], leading=10, alignment=TA_CENTER, spaceAfter=4
+            ),
+            "warn_cell": ps(
+                "warn_cell",
+                "Normal",
+                fontSize=7.5,
+                leading=10,
+                textColor=_C["warn"],
+                alignment=TA_CENTER,
+                fontName="Helvetica-Bold",
+            ),
+        }
+
+    @staticmethod
+    def _section(title: str, S: dict) -> list:
+        return [Spacer(1, 4), Paragraph(title, S["section"]), GCReport._Ruled()]
+
+    @staticmethod
+    def _subsection(title: str, S: dict) -> list:
+        return [Paragraph(title, S["subsection"])]
+
+    @staticmethod
+    def _table(data: list, col_widths, S: dict, highlight_cols: Optional[dict] = None) -> Table:
+        """
+        Cria tabela com cabeçalho estilizado, linhas alternadas e alerta de cor.
+        """
+        _C = GCReport._COLORS
+        styled_data = []
+        # Cabeçalho
+        header = [Paragraph(str(c), S["th"]) for c in data[0]]
+        styled_data.append(header)
+
+        for row in data[1:]:
+            styled_data.append([Paragraph(str(c), S["td"]) for c in row])
+
+        t = Table(styled_data, colWidths=col_widths, repeatRows=1)
+        cmd = [
+            # Cabeçalho
+            ("BACKGROUND", (0, 0), (-1, 0), _C["header_bg"]),
+            ("TEXTCOLOR", (0, 0), (-1, 0), _C["header_fg"]),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("GRID", (0, 0), (-1, -1), 0.4, _C["border"]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_C["row_even"], _C["row_alt"]]),
+        ]
+        t.setStyle(TableStyle(cmd))
+        return t
+
+    @staticmethod
+    def _kv_table(pairs: list[tuple], S: dict, col_w=(5.5 * cm, 11.5 * cm)) -> Table:
+        """Tabela chave→valor para parâmetros do método."""
+        _C = GCReport._COLORS
+        rows = []
+        for k, v in pairs:
+            rows.append(
+                [
+                    Paragraph(str(k), S["td_l"]),
+                    Paragraph(str(v), S["td"]),
+                ]
+            )
+        t = Table(rows, colWidths=list(col_w))
+        t.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("GRID", (0, 0), (-1, -1), 0.4, _C["border"]),
+                    ("ROWBACKGROUNDS", (0, 0), (-1, -1), [_C["row_even"], _C["row_alt"]]),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                ]
+            )
+        )
+        return t
+
+    @staticmethod
+    def _chromatogram_figure(
+        rt: np.ndarray,
+        intensity: np.ndarray,
+        results_df: pd.DataFrame,
+        run_label: str = "",
+        fig_w: float = 17.0,  # cm
+        fig_h: float = 8.5,  # cm
+    ) -> io.BytesIO:
+        """Gera um cromatograma limpo (sinal + picos marcados, sem áreas/baseline)."""
+        dpi = 180
+        fig, ax = plt.subplots(figsize=(fig_w / 2.54, fig_h / 2.54), dpi=dpi)
+
+        ax.plot(rt, intensity, lw=0.9, color="#1B2A4A", zorder=2)
+
+        peak_colors = plt.cm.tab10.colors
+        for i, (_, row) in enumerate(results_df.iterrows()):
+            rt_pk = row.get("marker_rt", row.get("rt", np.nan))
+            ht_pk = row.get("marker_height", row.get("height", np.nan))
+            if not (np.isfinite(rt_pk) and np.isfinite(ht_pk)):
+                continue
+            col = peak_colors[i % len(peak_colors)]
+            ax.axvline(rt_pk, ymin=0, ymax=0.92, lw=0.6, color=col, linestyle="--", alpha=0.55, zorder=1)
+            ax.plot(rt_pk, ht_pk, "o", ms=4, color=col, zorder=3)
+            peak_num = i + 1
+            ax.annotate(
+                str(peak_num),
+                xy=(rt_pk, ht_pk),
+                xytext=(0, 7),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=6,
+                color=col,
+                fontweight="bold",
+            )
+
+        ax.set_xlabel("Tempo de Retenção (s)", fontsize=7.5)
+        ax.set_ylabel("Intensidade (u.a.)", fontsize=7.5)
+        if run_label:
+            ax.set_title(run_label, fontsize=8, pad=4, color="#1B2A4A")
+        ax.tick_params(labelsize=6.5)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.2e}" if abs(x) >= 1e5 else f"{x:.0f}"))
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="x", lw=0.3, alpha=0.4, linestyle=":")
+        fig.tight_layout(pad=0.5)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    @staticmethod
+    def _comparison_figure(
+        runs: list,  # list of (rt, intensity, label)
+        fig_w: float = 17.0,
+        fig_h: float = 9.0,
+    ) -> io.BytesIO:
+        """Sobreposição de múltiplos cromatogramas normalizados."""
+        dpi = 180
+        fig, ax = plt.subplots(figsize=(fig_w / 2.54, fig_h / 2.54), dpi=dpi)
+        palette = plt.cm.Set1.colors
+
+        for i, (rt, sig, label) in enumerate(runs):
+            sig_n = sig / (np.max(sig) if np.max(sig) > 0 else 1.0)
+            ax.plot(rt, sig_n, lw=0.9, label=label, color=palette[i % len(palette)], alpha=0.85)
+
+        ax.set_xlabel("Tempo de Retenção (s)", fontsize=7.5)
+        ax.set_ylabel("Intensidade Normalizada", fontsize=7.5)
+        ax.set_title("Sobreposição de Cromatogramas", fontsize=8, pad=4, color="#1B2A4A")
+        ax.tick_params(labelsize=6.5)
+        ax.legend(fontsize=6.5, framealpha=0.7, loc="upper right")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="x", lw=0.3, alpha=0.4, linestyle=":")
+        fig.tight_layout(pad=0.5)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    @staticmethod
+    def _make_page_template(report_title: str, run_label: str = ""):
+        _C = GCReport._COLORS
+
+        def _on_page(canv, doc):
+            W, H = A4
+            # ── Faixa superior ───────────────────────────────────────────────
+            canv.saveState()
+            canv.setFillColor(_C["header_bg"])
+            canv.rect(0, H - 1.2 * cm, W, 1.2 * cm, fill=1, stroke=0)
+            canv.setFont("Helvetica-Bold", 8)
+            canv.setFillColor(colors.white)
+            canv.drawString(1.5 * cm, H - 0.82 * cm, report_title)
+            if run_label:
+                canv.setFont("Helvetica", 7.5)
+                canv.drawRightString(W - 1.5 * cm, H - 0.82 * cm, run_label)
+            # ── Rodapé ──────────────────────────────────────────────────────
+            canv.setFillColor(_C["border"])
+            canv.rect(0, 0, W, 0.9 * cm, fill=1, stroke=0)
+            canv.setFont("Helvetica", 7)
+            canv.setFillColor(colors.HexColor("#444444"))
+            canv.drawString(1.5 * cm, 0.32 * cm, f"GCReport  |  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+            canv.drawRightString(W - 1.5 * cm, 0.32 * cm, f"Pág. {doc.page}")
+            canv.restoreState()
+
+        return _on_page
+
+    # ── API pública ──────────────────────────────────────────────────────────
+
+    def add_run(
+        self,
+        rt: np.ndarray,
+        raw: np.ndarray,
+        corrected: np.ndarray,
+        baseline: np.ndarray,
+        results_df: pd.DataFrame,
+        label: str = "",
+    ) -> "GCReport":
+        """Adiciona uma corrida ao relatório. Retorna self para encadeamento."""
+        if not label:
+            label = f"Corrida {len(self._runs) + 1}"
+        self._runs.append(
+            self._RunData(
+                rt=np.asarray(rt),
+                raw=np.asarray(raw),
+                corrected=np.asarray(corrected),
+                baseline=np.asarray(baseline),
+                results_df=results_df.reset_index(drop=True),
+                label=label,
+            )
+        )
+        return self
+
+    def build(self, output_path: str | Path) -> str:
+        """Constrói e salva o PDF. Retorna o caminho absoluto do arquivo."""
+        output_path = str(Path(output_path).resolve())
+        S = self._build_styles()
+
+        doc = SimpleDocTemplate(
+            output_path,
+            pagesize=A4,
+            leftMargin=1.8 * cm,
+            rightMargin=1.8 * cm,
+            topMargin=1.8 * cm,
+            bottomMargin=1.6 * cm,
+            title=self.title,
+            author=self.analyst or "GCAnalyzer",
+            subject="Relatório de Análise Cromatográfica",
+        )
+
+        story = []
+        story += self._page_cover(S)
+        story.append(PageBreak())
+        story += self._page_method(S)
+
+        for run in self._runs:
+            story.append(PageBreak())
+            story += self._page_run(run, S)
+
+        if len(self._runs) > 1:
+            story.append(PageBreak())
+            story += self._page_comparison(S)
+
+        story.append(PageBreak())
+        story += self._page_appendix(S)
+
+        on_page = self._make_page_template(self.title)
+        doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+        return output_path
+
+    # ── Páginas ──────────────────────────────────────────────────────────────
+
+    def _page_cover(self, S: dict) -> list:
+        _C = self._COLORS
+        el = []
+        el.append(Spacer(1, 3.5 * cm))
+        el.append(Paragraph(self.title, S["cover_title"]))
+        el.append(Spacer(1, 0.4 * cm))
+        el.append(self._Ruled(color=_C["accent"], thickness=1.5, space=8))
+
+        meta_pairs = [
+            ("Data / Hora", datetime.now(timezone.utc).strftime("%d/%m/%Y  %H:%M UTC")),
+            ("Analista", self.analyst or "—"),
+            ("Laboratório", self.lab or "—"),
+            ("Instrumento", self.instrument or "—"),
+            ("Amostra / Lote", self.sample_info or "—"),
+            ("Método", f"{self._analyzer.method.name}  v{self._analyzer.method.version}"),
+            ("Corridas incluídas", str(len(self._runs))),
+        ]
+        for k, v in meta_pairs:
+            el.append(Paragraph(f"<b>{k}:</b>  {v}", S["cover_meta"]))
+
+        el.append(Spacer(1, 1.0 * cm))
+        el.append(self._Ruled(color=_C["border"], thickness=0.5, space=6))
+        el.append(
+            Paragraph(
+                "Gerado automaticamente por <b>GCAnalyzer / GCReport</b>. "
+                "Este documento contém resultados de análise cromatográfica incluindo "
+                "parâmetros de eficiência (USP/EP), resolução e qualidade cromatográfica. "
+                "Verifique os valores de TF, Rs e N em relação às especificações do método.",
+                S["body"],
+            )
+        )
+
+        if self._runs:
+            el.append(Spacer(1, 0.6 * cm))
+            run_rows = [["#", "Identificação", "N° Picos", "RT min (s)", "RT max (s)"]]
+            for i, run in enumerate(self._runs):
+                df = run.results_df
+                rts = df["rt"].dropna() if "rt" in df.columns else pd.Series([], dtype=float)
+                run_rows.append(
+                    [
+                        str(i + 1),
+                        run.label,
+                        str(len(df)),
+                        self._fmt(rts.min(), 2) if len(rts) else "—",
+                        self._fmt(rts.max(), 2) if len(rts) else "—",
+                    ]
+                )
+            W = A4[0] - 3.6 * cm
+            el.append(self._table(run_rows, [1 * cm, 6 * cm, 2 * cm, 2.5 * cm, 2.5 * cm], S))
+
+        return el
+
+    def _page_method(self, S: dict) -> list:
+        m = self._analyzer.method
+        el = []
+        el += self._section("Parâmetros do Método de Processamento", S)
+        el.append(
+            Paragraph(
+                f"Método: <b>{m.name}</b>  |  Versão: <b>{m.version}</b>  |  "
+                f"Criado por: {m.created_by or '—'}  |  "
+                f"Data: {m.created_at}",
+                S["body"],
+            )
+        )
+        if m.description:
+            el.append(Paragraph(f"Descrição: {m.description}", S["body"]))
+        el.append(Spacer(1, 4))
+
+        groups = [
+            (
+                "Baseline e Ruído",
+                [
+                    (
+                        "baseline_lam  (λ)",
+                        f"{m.baseline_lam:.2e}",
+                        "Penalidade de suavização do Whittaker AsLS. Maior λ → baseline mais suave.",
+                    ),
+                    (
+                        "baseline_p",
+                        f"{m.baseline_p:.6f}",
+                        "Assimetria AsLS. Valores < 0.01 para cromatogramas (picos positivos).",
+                    ),
+                    (
+                        "noise_percentile",
+                        str(m.noise_percentile),
+                        "Percentil da intensidade usado para estimar a região de baseline para cálculo do ruído MAD.",
+                    ),
+                ],
+            ),
+            (
+                "Detecção de Picos",
+                [
+                    ("snr_threshold", f"{m.snr_threshold:.2f}", "SNR mínimo local para aceitação de um pico."),
+                    (
+                        "min_width_seconds (s)",
+                        f"{m.min_width_seconds:.2f}",
+                        "Largura mínima do pico em segundos para aceitação.",
+                    ),
+                    (
+                        "min_distance_seconds (s)",
+                        f"{m.min_distance_seconds:.2f}",
+                        "Separação mínima entre ápices de picos distintos.",
+                    ),
+                    (
+                        "sg_window_length",
+                        str(m.sg_window_length) + (" (auto)" if m.sg_window_length == 0 else ""),
+                        "Janela do filtro Savitzky-Golay (0 = estimativa automática).",
+                    ),
+                    (
+                        "sg_polyorder",
+                        str(m.sg_polyorder),
+                        "Ordem do polinômio do filtro SG. Deve ser < sg_window_length.",
+                    ),
+                    (
+                        "slope_threshold_factor",
+                        f"{m.slope_threshold_factor:.3f}",
+                        "Fator para limiar slope-to-slope: threshold = factor × σ_ruído / dt. 0 = desativado.",
+                    ),
+                ],
+            ),
+            (
+                "Integração e Sobreposição",
+                [
+                    (
+                        "rs_deconv_threshold",
+                        f"{m.rs_deconv_threshold:.2f}",
+                        "Rs abaixo do qual dois picos são tratados como sobrepostos.",
+                    ),
+                    (
+                        "valley_pct_independent (%)",
+                        f"{m.valley_pct_independent:.1f}",
+                        "% mínima do vale para picos tratados como independentes.",
+                    ),
+                    (
+                        "valley_pct_dropline (%)",
+                        f"{m.valley_pct_dropline:.1f}",
+                        "% mínima do vale para integração por drop-line.",
+                    ),
+                    ("valley_pct_skim_max (%)", f"{m.valley_pct_skim_max:.1f}", "% máxima do vale para tangent skim."),
+                    (
+                        "height_ratio_rider",
+                        f"{m.height_ratio_rider:.3f}",
+                        "Razão de altura máxima para classificar um pico como 'rider' (tangent skim).",
+                    ),
+                ],
+            ),
+            (
+                "Filtros de QC e Janelas",
+                [
+                    (
+                        "solvent_rt_cutoff_s (s)",
+                        f"{m.solvent_rt_cutoff_s:.1f}",
+                        "Tempo de retenção abaixo do qual picos são considerados solvente.",
+                    ),
+                    (
+                        "solvent_area_factor",
+                        f"{m.solvent_area_factor:.1f}",
+                        "Picos com área > fator × mediana são removidos como solvente.",
+                    ),
+                    (
+                        "t_start_integration (s)",
+                        f"{m.t_start_integration:.1f}",
+                        "Tempo de início da janela de integração (ignora pontos anteriores).",
+                    ),
+                    (
+                        "min_area_threshold",
+                        f"{m.min_area_threshold:.2f}",
+                        "Área mínima absoluta para aceitar um pico. 0 = desativado.",
+                    ),
+                    (
+                        "expected_peaks_count",
+                        str(m.expected_peaks_count) if m.expected_peaks_count is not None else "— (desativado)",
+                        "Contagem esperada de picos para alerta de QC.",
+                    ),
+                    (
+                        "integration_inhibit_windows",
+                        str(m.integration_inhibit_windows) or "[]",
+                        "Janelas de tempo onde a integração é suprimida.",
+                    ),
+                    (
+                        "force_integration_windows",
+                        str(m.force_integration_windows) or "[]",
+                        "Janelas de integração forçada pelo usuário.",
+                    ),
+                ],
+            ),
+            (
+                "Padrão Interno e Alinhamento",
+                [
+                    (
+                        "is_rt_seconds (s)",
+                        self._fmt(m.is_rt_seconds, 2) if m.is_rt_seconds else "— (desativado)",
+                        "Tempo de retenção nominal do padrão interno.",
+                    ),
+                    (
+                        "is_search_window_s (s)",
+                        f"{m.is_search_window_s:.1f}",
+                        "Janela de busca ±s ao redor do RT do IS.",
+                    ),
+                    (
+                        "rrt_bin_tolerance",
+                        f"{m.rrt_bin_tolerance:.3f}",
+                        "Tolerância de RRT para agrupamento de picos entre corridas.",
+                    ),
+                    (
+                        "dead_time_s (s)",
+                        f"{m.dead_time_s:.3f}",
+                        "Tempo morto da coluna (t0). Necessário para k' e seletividade. 0 = desativado.",
+                    ),
+                ],
+            ),
+            (
+                "CQI — Pesos e Referências",
+                [
+                    (
+                        "cqi_weight_n / rs / tf / snr",
+                        f"{m.cqi_weight_n} / {m.cqi_weight_rs} / {m.cqi_weight_tf} / {m.cqi_weight_snr}",
+                        "Pesos relativos de cada sub-score no CQI (média geométrica ponderada).",
+                    ),
+                    ("cqi_n_ref", f"{m.cqi_n_ref:.0f}", "N de referência para normalização do sub-score de eficiência."),
+                    (
+                        "cqi_rs_ref",
+                        f"{m.cqi_rs_ref:.2f}",
+                        "Rs de referência para normalização (USP: ≥ 1.5 = baseline resolved).",
+                    ),
+                    (
+                        "cqi_snr_ref",
+                        f"{m.cqi_snr_ref:.1f}",
+                        "SNR de referência para normalização do sub-score de ruído.",
+                    ),
+                ],
+            ),
+        ]
+
+        for group_title, params in groups:
+            el += self._subsection(group_title, S)
+            rows = [["Parâmetro", "Valor", "Descrição"]]
+            for name, val, desc in params:
+                rows.append([name, val, desc])
+            W = A4[0] - 3.6 * cm
+            el.append(self._table(rows, [5.0 * cm, 3.0 * cm, W - 8.0 * cm], S))
+            el.append(Spacer(1, 5))
+
+        return el
+
+    def _page_run(self, run: _RunData, S: dict) -> list:
+        _C = self._COLORS
+        el = []
+        el += self._section(f"Cromatograma: {run.label}", S)
+
+        # ── Figura ────────────────────────────────────────────────────────────
+        fig_buf = self._chromatogram_figure(run.rt, run.corrected, run.results_df, run_label=run.label)
+        img = Image(fig_buf, width=16.5 * cm, height=8.3 * cm)
+        el.append(img)
+        el.append(
+            Paragraph(
+                f"Figura: Cromatograma corrigido de baseline — <i>{run.label}</i>. "
+                "Os picos detectados são indicados por marcadores numerados. "
+                "A numeração corresponde à ordem de elução (coluna # na tabela abaixo).",
+                S["caption"],
+            )
+        )
+        el.append(Spacer(1, 5))
+
+        df = run.results_df
+        if df.empty:
+            el.append(Paragraph("Nenhum pico detectado nesta corrida.", S["body"]))
+            return el
+
+        # ── Tabela de picos ───────────────────────────────────────────────────
+        el += self._subsection("Resultados por Pico", S)
+
+        # Colunas a exibir com suas fontes no df
+        col_spec = [
+            ("#", None),
+            ("tR (s)[1]", "rt"),
+            ("Área[2]", "area"),
+            ("Área%[3]", "area_pct"),
+            ("Altura[4]", "height"),
+            ("SNR[5]", "snr"),
+            ("W½(s)[6]", "W_half_s"),
+            ("Wbase(s)[7]", "W_base_s"),
+            ("N(EP)[8]", "N_plates_ep"),
+            ("N(USP)[9]", "N_plates_usp"),
+            ("TF[10]", "tailing_factor_usp"),
+            ("As(EP)[11]", "asymmetry_factor_ep"),
+            ("Rs USP[12]", "Rs_usp"),
+            ("Rs EP[13]", "Rs_ep"),
+            ("k'[14]", "k_prime"),
+            ("α[15]", "alpha"),
+            ("SQS[16]", "shape_quality_score"),
+            ("CQI[17]", "CQI"),
+            ("Método[18]", "integration_method"),
+        ]
+        # Remove colunas ausentes no df (exceto #)
+        avail_cols = [(h, c) for h, c in col_spec if c is None or c in df.columns]
+
+        header = [h for h, _ in avail_cols]
+        rows = [header]
+
+        for i, (_, row) in enumerate(df.iterrows()):
+            peak_row = []
+            for h, col in avail_cols:
+                if col is None:
+                    peak_row.append(str(i + 1))
+                else:
+                    v = row.get(col, np.nan)
+                    if col in ("integration_method",):
+                        peak_row.append(str(v) if pd.notna(v) else "—")
+                    elif col in ("area", "height", "N_plates_ep", "N_plates_usp"):
+                        peak_row.append(self._fmt(v, 0))
+                    elif col in ("area_pct", "snr", "SNR"):
+                        peak_row.append(self._fmt(v, 1))
+                    else:
+                        peak_row.append(self._fmt(v, 3))
+            rows.append(peak_row)
+
+        n_cols = len(avail_cols)
+        W = A4[0] - 3.6 * cm
+        # Distribui larguras: # pequeno, método largo, demais iguais
+        fixed = {0: 0.6 * cm, n_cols - 1: 2.0 * cm}
+        remaining = W - sum(fixed.values())
+        default_w = remaining / (n_cols - len(fixed))
+        col_widths = [fixed.get(i, default_w) for i in range(n_cols)]
+
+        peak_table = self._table(rows, col_widths, S)
+
+        # Colorir células fora de spec
+        alert_map = {
+            "TF[10]": "tailing_factor_usp",
+            "As(EP)[11]": "asymmetry_factor_ep",
+            "Rs USP[12]": "Rs_usp",
+            "SNR[5]": "snr",
+        }
+        cmd_extra = []
+        for r_idx, (_, row) in enumerate(df.iterrows(), start=1):
+            for h_idx, (h, col) in enumerate(avail_cols):
+                col_key = alert_map.get(h)
+                if col_key and col_key in df.columns:
+                    color = self._verdict_color(col_key, row.get(col_key, np.nan))
+                    if color:
+                        cmd_extra.append(("TEXTCOLOR", (h_idx, r_idx), (h_idx, r_idx), color))
+                        cmd_extra.append(("FONTNAME", (h_idx, r_idx), (h_idx, r_idx), "Helvetica-Bold"))
+        if cmd_extra:
+            from reportlab.platypus import TableStyle as _TS
+
+            peak_table.setStyle(_TS(cmd_extra))
+
+        el.append(peak_table)
+        el.append(Spacer(1, 4))
+
+        # ── Estatísticas globais da corrida ───────────────────────────────────
+        el += self._subsection("Estatísticas Globais da Corrida", S)
+        el.append(self._global_stats_table(df, S))
+
+        return el
+
+    def _global_stats_table(self, df: pd.DataFrame, S: dict) -> Table:
+        def stat(col, label, dec=1):
+            if col not in df.columns:
+                return (label, "—", "—", "—", "—")
+            s = df[col].dropna()
+            if s.empty:
+                return (label, "—", "—", "—", "—")
+            return (
+                label,
+                self._fmt(s.mean(), dec),
+                self._fmt(s.std(), dec),
+                self._fmt(s.min(), dec),
+                self._fmt(s.max(), dec),
+            )
+
+        rows = [["Métrica", "Média", "DP", "Mínimo", "Máximo"]]
+        for col, label, dec in [
+            ("N_plates_ep", "N (EP)", 0),
+            ("N_plates_usp", "N (USP)", 0),
+            ("tailing_factor_usp", "TF (USP)", 3),
+            ("asymmetry_factor_ep", "As (EP)", 3),
+            ("Rs_usp", "Rs USP", 3),
+            ("Rs_ep", "Rs EP", 3),
+            ("snr", "SNR", 1),
+            ("area_pct", "Área %", 2),
+            ("W_half_s", "W½ (s)", 3),
+            ("CQI", "CQI", 3),
+        ]:
+            rows.append(list(stat(col, label, dec)))
+
+        W = A4[0] - 3.6 * cm
+        return self._table(rows, [5 * cm, (W - 5 * cm) / 4] * 4, S)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Utilitário interno: agrupa picos de todas as corridas por RT próximo
+    # ─────────────────────────────────────────────────────────────────────────
+    def _group_peaks_by_rt(self, tol: float = 5.0) -> list[list[dict]]:
+        """Agrupa entradas {label, rt, area} de todas as corridas por RT ±tol."""
+        all_entries: list[dict] = []
+        for run in self._runs:
+            df = run.results_df
+            if "rt" not in df.columns:
+                continue
+            for _, row in df.iterrows():
+                rt_val = row.get("rt")
+                if pd.notna(rt_val):
+                    all_entries.append(
+                        {
+                            "label": run.label,
+                            "rt": float(rt_val),
+                            "area": float(row.get("area", np.nan)),
+                        }
+                    )
+
+        groups: list[list[dict]] = []
+        for entry in sorted(all_entries, key=lambda x: x["rt"]):
+            placed = False
+            for g in groups:
+                center = sum(e["rt"] for e in g) / len(g)
+                if abs(entry["rt"] - center) <= tol:
+                    g.append(entry)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([entry])
+        return groups
+
+    def _page_comparison(self, S: dict) -> list:
+        _C = self._COLORS
+        el = []
+        el += self._section("Comparação Entre Corridas", S)
+        W = A4[0] - 3.6 * cm
+        labels = [r.label for r in self._runs]
+
+        # ── 1. Sobreposição de cromatogramas ──────────────────────────────────
+        runs_for_plot = [(r.rt, r.corrected, r.label) for r in self._runs]
+        img = Image(self._comparison_figure(runs_for_plot), width=16.5 * cm, height=9.0 * cm)
+        el.append(img)
+        el.append(
+            Paragraph(
+                "Figura: Sobreposição dos cromatogramas normalizados (intensidade máxima = 1). "
+                "Permite comparação visual de tempos de retenção e perfis de elução.",
+                S["caption"],
+            )
+        )
+        el.append(Spacer(1, 8))
+
+        # ── 2. Correlação par-a-par ───────────────────────────────────────────
+        el += self._subsection("Índices de Correlação Par-a-Par (Fingerprinting)", S)
+        el.append(
+            Paragraph(
+                "Comparação entre pares de cromatogramas sobre os sinais contínuos completos "
+                "(não apenas picos detectados). Permite detectar diferenças globais de perfil, "
+                "impurezas fora das janelas de integração e deriva de baseline.",
+                S["body"],
+            )
+        )
+        el.append(Spacer(1, 4))
+
+        from itertools import combinations
+
+        pairs = list(combinations(range(len(self._runs)), 2))
+
+        if pairs:
+            corr_header = [
+                "Corrida A",
+                "Corrida B",
+                "Pearson r",
+                "R²",
+                "Cos. Sim.",
+                "Ângulo (°)",
+                "NRMSE",
+                "Verdict",
+            ]
+            corr_rows = [corr_header]
+
+            for i, j in pairs:
+                ra, rb = self._runs[i], self._runs[j]
+                try:
+                    res = self._analyzer.compare_chromatograms(ra.rt, ra.corrected, rb.rt, rb.corrected)
+                    verdict = res.get("verdict", "—")
+                    verdict_color_map = {
+                        "IDENTICAL": _C["ok"],
+                        "SIMILAR": _C["ok"],
+                        "ACCEPTABLE": _C["accent"],
+                        "DIFFERENT": _C["warn"],
+                    }
+                    corr_rows.append(
+                        [
+                            ra.label[:18],
+                            rb.label[:18],
+                            self._fmt(res.get("pearson_r"), 4),
+                            self._fmt(res.get("pearson_r2"), 4),
+                            self._fmt(res.get("cosine_similarity"), 4),
+                            self._fmt(res.get("spectral_contrast_angle_deg"), 2),
+                            self._fmt(res.get("nrmse"), 4),
+                            verdict,
+                        ]
+                    )
+                except Exception as exc:
+                    corr_rows.append([ra.label[:18], rb.label[:18], "—", "—", "—", "—", "—", f"ERRO: {exc}"])
+
+            cw_c = [3.8 * cm, 3.8 * cm, 1.6 * cm, 1.6 * cm, 1.8 * cm, 1.8 * cm, 1.8 * cm, 2.4 * cm]
+            corr_table = self._table(corr_rows, cw_c, S)
+
+            # Colorir coluna Verdict
+            verdict_col_idx = len(corr_header) - 1
+            cmd_v = []
+            for r_idx, row in enumerate(corr_rows[1:], start=1):
+                verdict_val = row[verdict_col_idx]
+                color_v = {
+                    "IDENTICAL": _C["ok"],
+                    "SIMILAR": _C["ok"],
+                    "ACCEPTABLE": _C["accent"],
+                    "DIFFERENT": _C["warn"],
+                }.get(verdict_val)
+                if color_v:
+                    cmd_v += [
+                        ("TEXTCOLOR", (verdict_col_idx, r_idx), (verdict_col_idx, r_idx), color_v),
+                        ("FONTNAME", (verdict_col_idx, r_idx), (verdict_col_idx, r_idx), "Helvetica-Bold"),
+                    ]
+            if cmd_v:
+                from reportlab.platypus import TableStyle as _TS2
+
+                corr_table.setStyle(_TS2(cmd_v))
+
+            el.append(corr_table)
+            el.append(
+                Paragraph(
+                    "Pearson r: correlação linear (escala-dependente). "
+                    "Cos. Sim.: similaridade de cosseno (insensível a diferenças de escala — mede forma). "
+                    "NRMSE: RMSE normalizado pelo range do sinal. "
+                    "Verdict: IDENTICAL r≥0.999 | SIMILAR r≥0.990 | ACCEPTABLE r≥0.950 | DIFFERENT r&lt;0.950.",
+                    S["footnote"],
+                )
+            )
+        el.append(Spacer(1, 10))
+
+        # ── 3. Comparação de RT e Área por pico ───────────────────────────────
+        el += self._subsection("Comparação de Tempos de Retenção e Áreas por Pico", S)
+        el.append(
+            Paragraph(
+                "Picos agrupados por proximidade de tempo de retenção (tolerância ±5 s). "
+                "Para cada grupo, são apresentados RT e área de cada corrida, "
+                "além do desvio máximo de RT e a variação relativa de área entre pares.",
+                S["body"],
+            )
+        )
+        el.append(Spacer(1, 4))
+
+        groups = self._group_peaks_by_rt(tol=5.0)
+
+        # Cabeçalho dinâmico por corrida
+        rt_cols = [f"RT {lbl[:10]} (s)" for lbl in labels]
+        area_cols = [f"Área {lbl[:10]}" for lbl in labels]
+        header_rt_area = (
+            ["Grp", "RT médio (s)", "ΔRT máx (s)"] + rt_cols + ["Área média", "Área CV%"] + area_cols + ["Δ Área máx %"]
+        )
+
+        rows_ra = [header_rt_area]
+        for gi, g in enumerate(groups, 1):
+            by_label_rt = {e["label"]: e["rt"] for e in g}
+            by_label_area = {e["label"]: e["area"] for e in g}
+
+            rts_v = [v for v in by_label_rt.values() if np.isfinite(v)]
+            areas_v = [v for v in by_label_area.values() if np.isfinite(v)]
+
+            rt_mean = sum(rts_v) / len(rts_v) if rts_v else np.nan
+            rt_dmax = max(rts_v) - min(rts_v) if len(rts_v) > 1 else np.nan
+            area_mean = sum(areas_v) / len(areas_v) if areas_v else np.nan
+            area_cv = (np.std(areas_v) / area_mean * 100) if (area_mean and len(areas_v) > 1) else np.nan
+            # Δ área máxima relativa entre qualquer par
+            if len(areas_v) > 1:
+                area_delta_pct = (max(areas_v) - min(areas_v)) / area_mean * 100
+            else:
+                area_delta_pct = np.nan
+
+            row_ra = [
+                str(gi),
+                self._fmt(rt_mean, 2),
+                self._fmt(rt_dmax, 3),
+            ]
+            for lbl in labels:
+                row_ra.append(self._fmt(by_label_rt.get(lbl), 2))
+            row_ra += [self._fmt(area_mean, 0), self._fmt(area_cv, 1)]
+            for lbl in labels:
+                row_ra.append(self._fmt(by_label_area.get(lbl), 0))
+            row_ra.append(self._fmt(area_delta_pct, 1))
+            rows_ra.append(row_ra)
+
+        n_h = len(header_rt_area)
+        # Largura dinâmica: colunas fixas + colunas por corrida
+        fixed_cw = [1.0 * cm, 2.2 * cm, 2.0 * cm]
+        per_run_rt = (W - sum(fixed_cw) - 3.5 * cm) / (2 * len(labels) + 3)
+        dyn_cw = (
+            fixed_cw
+            + [per_run_rt] * len(labels)  # RT por corrida
+            + [2.0 * cm, 1.5 * cm]  # área média, CV%
+            + [per_run_rt] * len(labels)  # área por corrida
+            + [1.8 * cm]  # Δ área máx
+        )
+        el.append(self._table(rows_ra, dyn_cw, S))
+        el.append(
+            Paragraph(
+                "CV% = Coeficiente de Variação das áreas entre corridas. "
+                "Δ Área máx% = (max − min) / média × 100 entre todas as corridas do grupo. "
+                "Picos sem correspondente em outra corrida aparecem como '—' nas colunas ausentes.",
+                S["footnote"],
+            )
+        )
+        el.append(Spacer(1, 10))
+
+        # ── 4. Métricas médias por corrida ────────────────────────────────────
+        el += self._subsection("Métricas de Qualidade Médias por Corrida", S)
+        met_cols = [
+            ("N_plates_ep", "N (EP)", 0),
+            ("tailing_factor_usp", "TF USP", 3),
+            ("Rs_usp", "Rs USP", 3),
+            ("snr", "SNR", 1),
+            ("CQI", "CQI", 3),
+        ]
+        h_row = ["Corrida", "N Picos"] + [lbl for _, lbl, _ in met_cols]
+        rows2 = [h_row]
+        for run in self._runs:
+            df = run.results_df
+            row2 = [run.label[:22], str(len(df))]
+            for col, _, dec in met_cols:
+                if col in df.columns:
+                    s = df[col].dropna()
+                    row2.append(self._fmt(s.mean(), dec) if not s.empty else "—")
+                else:
+                    row2.append("—")
+            rows2.append(row2)
+        cw2 = [5.5 * cm, 1.5 * cm] + [(W - 7.0 * cm) / len(met_cols)] * len(met_cols)
+        el.append(self._table(rows2, cw2, S))
+
+        return el
+
+    def _page_appendix(self, S: dict) -> list:
+        _C = self._COLORS
+        el = []
+        el += self._section("Apêndice — Equações e Definições", S)
+
+        el += self._subsection("A. Equações dos Parâmetros Calculados", S)
+        el.append(
+            Paragraph(
+                "As equações a seguir correspondem aos cálculos implementados no módulo "
+                "<b>GCAnalyzer.compute_usp_metrics</b> e <b>compute_extended_metrics</b>. "
+                "As referências são USP &lt;621&gt; e Ph. Eur. 2.2.29.",
+                S["body"],
+            )
+        )
+        el.append(Spacer(1, 4))
+
+        for name, eq, desc in self._EQUATIONS:
+            el.append(
+                KeepTogether(
+                    [
+                        Paragraph(f"<b>{name}</b>", S["body"]),
+                        Paragraph(eq, S["eq"]),
+                        Paragraph(desc, S["body"]),
+                        Spacer(1, 5),
+                    ]
+                )
+            )
+
+        el.append(Spacer(1, 8))
+        el += self._subsection("B. Critérios de Aceitação de Referência", S)
+        accept_rows = [
+            ["Parâmetro", "Farmacopeia", "Critério", "Interpretação"],
+            ["N (pratos teóricos)", "USP / EP", "≥ 2000", "Mínimo para colunas analíticas."],
+            ["Tailing Factor (TF)", "USP <621>", "0.8 – 2.0", "> 2.0: tailing; < 0.8: fronting."],
+            ["Asymmetry Factor (As)", "Ph. Eur. 2.2.29", "≤ 2.0", "Medido a 10 % da altura."],
+            ["Resolução (Rs)", "USP / EP", "≥ 1.5", "Resolução de linha de base."],
+            ["SNR", "ICH Q2(R1)", "≥ 10 (quantificação)", "≥ 3 para detecção."],
+            ["k' (fator capacidade)", "Geral", "1 < k' < 20", "k' < 1: pouca retenção; k' > 20: tempo excessivo."],
+        ]
+        W = A4[0] - 3.6 * cm
+        el.append(self._table(accept_rows, [4 * cm, 3 * cm, 3.5 * cm, W - 10.5 * cm], S))
+
+        el.append(Spacer(1, 10))
+        el += self._subsection("C. Notas de Rodapé — Cabeçalhos das Tabelas", S)
+        fn_rows = [["Símbolo", "Definição"]]
+        for sym, defn in self._FOOTNOTES:
+            fn_rows.append([sym, defn])
+        el.append(self._table(fn_rows, [3.5 * cm, W - 3.5 * cm], S))
+
+        return el
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,6 +1348,89 @@ class ProcessingMethod:
     is_rt_seconds: Optional[float] = None
     is_search_window_s: float = 10.0
     rrt_bin_tolerance: float = 0.02
+
+    # ── Parâmetros de controle ISO 17025 ─────────────────────────────────────────
+
+    # t_start_integration : tempo de início da integração em segundos.
+    #   Pontos de tempo anteriores a este valor são excluídos antes da detecção
+    #   de picos.  Útil para ignorar o pico de injeção (solvent front) e a
+    #   instabilidade inicial do detector.
+    #   0.0 -> sem corte (integra desde o início do cromatograma).
+    t_start_integration: float = 0.0
+
+    # integration_inhibit_windows : janelas de inibição da integração.
+    #   Lista de tuplas (t_start, t_end) em segundos.  Qualquer pico cujo
+    #   ápice caia dentro de uma dessas janelas é silenciosamente descartado
+    #   durante a detecção.  Use para mascarar perturbações conhecidas como
+    #   trocas de válvula, pulsos de pressão ou artefatos de gradient delay.
+    #   Exemplo: [(120.0, 125.0), (300.0, 302.5)]
+    #   [] -> nenhuma janela de inibição ativa.
+    integration_inhibit_windows: list = field(default_factory=list)
+
+    # min_area_threshold : área mínima absoluta (em unidades de sinal x tempo).
+    #   Picos com área integrada inferior a este valor são descartados no pós-
+    #   processamento, complementando o filtro de SNR.  Captura picos fantasmas
+    #   estreitos e de alta amplitude pontual que passam o limiar de SNR mas
+    #   nao tem area real relevante (ex.: spikes de eletronica).
+    #   0.0 -> sem filtro de area minima.
+    min_area_threshold: float = 0.0
+
+    # expected_peaks_count : numero esperado de picos no cromatograma.
+    #   Se o numero de picos detectados diferir deste valor, um evento de nivel
+    #   WARN e emitido no audit trail.  Nao bloqueia o pipeline.
+    #   None -> QC de contagem desativado.
+    expected_peaks_count: Optional[int] = None
+
+    # force_integration_windows : regioes de integracao forcada.
+    #   Lista de tuplas (t_start, t_end) em segundos que definem janelas onde
+    #   o usuario sabe que existe um pico, independente de o detector automatico
+    #   te-lo encontrado ou nao.  Para cada janela:
+    #     - O sinal e fatiado em [t_start, t_end].
+    #     - O apice e determinado como o argmax da intensidade no segmento.
+    #     - Um ajuste EMG + integracao trapezoidal sao executados normalmente.
+    #     - O resultado entra no DataFrame com integration_method='FORCED'.
+    #   Picos forcados BYPASS todos os filtros automaticos (SNR, area minima,
+    #   solvente) -- a responsabilidade pelos limites e do usuario.
+    #   Se a janela ja contem um pico detectado automaticamente, ambos
+    #   coexistem; use integration_inhibit_windows para suprimir a deteccao
+    #   automatica nessa regiao e manter apenas o forcado.
+    #   [] -> nenhuma integracao forcada ativa.
+    force_integration_windows: list = field(default_factory=list)
+
+    # ── Integração Slope-to-Slope ────────────────────────────────────────────
+    # Define a sensibilidade da inclinação para detecção dos limites do pico.
+    # O limiar absoluto é calculado em tempo de execução como:
+    #
+    #   d1_threshold = slope_threshold_factor × noise_sigma / dt
+    #
+    # onde noise_sigma é o ruído MAD do cromatograma e dt é o passo de tempo.
+    # Isso garante que o limiar seja proporcional ao ruído do sinal (adimensional
+    # em relação à morfologia de cada corrida) e esteja nas mesmas unidades de d1
+    # (intensidade/tempo).
+    #
+    # Valores típicos:
+    #   0.05 – 0.20 : sensível, captura o pico até a cauda longa (default: 0.10)
+    #   0.50 – 1.00 : conservador, integra apenas o núcleo do pico
+    #
+    # 0.0 → desativa slope-to-slope; usa peak_widths(rel_height=0.95) puro.
+    slope_threshold_factor: float = 0.10
+
+    # ── Suavização Savitzky-Golay ────────────────────────────────────────────
+    # Usados na detecção de picos (find_peaks) para calcular d¹ e d² do sinal.
+    # O filtro SG preserva melhor a altura do pico e a FWHM que o gaussiano,
+    # o que é crítico para o cálculo correto de N (pratos teóricos).
+    #
+    # sg_window_length : número ímpar de pontos da janela deslizante.
+    #   0 → estimativa automática: ≈ 1.5× a largura média dos picos em pontos
+    #       (calculada em tempo de execução). Mínimo forçado = 5.
+    #   Recomendação manual: ~1.5 × (FWHM_média_em_pontos), arredondado para ímpar.
+    #
+    # sg_polyorder : ordem do polinômio ajustado dentro da janela.
+    #   2 → suavização agressiva, ideal para ruído alto.
+    #   4 → preserva melhor formas de pico assimétricas (EMG).
+    #   Deve ser estritamente menor que sg_window_length.
+    sg_window_length: int = 0  # 0 = auto
+    sg_polyorder: int = 4
 
     # ── Fator de capacidade / seletividade ───────────────────────────────────
     # dead_time_s : tempo morto (t₀) da coluna em segundos.
@@ -358,7 +1689,7 @@ class AuditLogger:
 # 🔬  GCAnalyzer
 # ══════════════════════════════════════════════════════════════════════════════
 
-from scipy.signal import find_peaks as _scipy_find_peaks, peak_widths
+from scipy.signal import find_peaks as _scipy_find_peaks, peak_widths, savgol_filter as _savgol_filter
 from scipy.optimize import curve_fit
 from scipy.stats import exponnorm
 from scipy.integrate import trapezoid
@@ -518,9 +1849,96 @@ class GCAnalyzer:
         return area, x_seg, y_above, baseline_virtual
 
     # ==========================================================
+    # 3️⃣d LIMITES SLOPE-TO-SLOPE
+    # ==========================================================
+    @staticmethod
+    def _slope_to_slope_bounds(
+        d1: np.ndarray,
+        peak_idx: int,
+        fallback_left: int,
+        fallback_right: int,
+        slope_threshold: float,
+        n_pts: int,
+    ) -> tuple[int, int]:
+        """Determina os limites de integração pelo critério de sensibilidade de
+        inclinação (slope sensitivity), análogo ao implementado em Agilent
+        OpenLab, Chromeleon e EZChrom.
+
+        Algoritmo
+        ---------
+        Partindo do ápice do pico (onde d1 ≈ 0):
+
+        • Lado esquerdo — caminha para trás (t decrescente).
+          d1 é positivo na rampa ascendente.  O início do pico é o ponto mais
+          à esquerda onde d1 ainda supera +slope_threshold; um ponto além
+          dele (onde a inclinação já caiu abaixo do limiar) é o limite.
+
+        • Lado direito — caminha para frente (t crescente).
+          d1 é negativo na rampa descendente.  O fim do pico é o ponto mais
+          à direita onde d1 ainda é inferior a −slope_threshold.
+
+        Se a caminhada não encontrar nenhum cruzamento válido dentro da janela
+        de busca, retorna o limite de fallback fornecido (peak_widths 95%).
+
+        Parâmetros
+        ----------
+        d1               : derivada primeira suavizada (SG) — shape (n_pts,)
+        peak_idx         : índice do ápice na array d1
+        fallback_left/right : limites derivados de peak_widths(rel_height=0.95)
+        slope_threshold  : limiar absoluto = factor × noise_sigma / dt
+        n_pts            : comprimento total do array
+
+        Retorna
+        -------
+        (left, right) como índices inteiros dentro de [0, n_pts-1]
+        """
+        # ── Lado esquerdo ────────────────────────────────────────────────────
+        left = fallback_left  # fallback se nenhum cruzamento for achado
+        for i in range(peak_idx - 1, max(fallback_left - 1, -1), -1):
+            if d1[i] < slope_threshold:
+                # d1 cruzou abaixo do limiar positivo → aqui termina a rampa
+                # ascendente; o limite do pico é o ponto seguinte (mais à direita)
+                left = min(i + 1, peak_idx)
+                break
+
+        # ── Lado direito ─────────────────────────────────────────────────────
+        right = fallback_right  # fallback
+        for i in range(peak_idx + 1, min(fallback_right + 1, n_pts)):
+            if d1[i] > -slope_threshold:
+                # d1 cruzou acima do limiar negativo → rampa descendente encerrou
+                right = max(i - 1, peak_idx)
+                break
+
+        # Garantias de sanidade
+        left = int(np.clip(left, 0, peak_idx))
+        right = int(np.clip(right, peak_idx, n_pts - 1))
+        return left, right
+
+    # ==========================================================
     # 4️⃣  DETECÇÃO DE PICOS
     # ==========================================================
     def find_peaks(self, rt, intensity):
+        # ── t_start_integration: corte temporal no início do cromatograma ─────
+        t_start = self._m.t_start_integration
+        if t_start > 0.0:
+            mask_start = rt >= t_start
+            n_cut = int(np.sum(~mask_start))
+            if n_cut > 0:
+                self.audit.info(
+                    "PeakDetection",
+                    f"t_start_integration={t_start:.2f}s: {n_cut} ponto(s) iniciais excluídos da detecção.",
+                    t_start_integration=t_start,
+                    n_points_cut=n_cut,
+                )
+                rt = rt[mask_start]
+                intensity = intensity[mask_start]
+            else:
+                self.audit.info(
+                    "PeakDetection",
+                    f"t_start_integration={t_start:.2f}s: nenhum ponto excluído (RT já começa após o corte).",
+                    t_start_integration=t_start,
+                )
+
         snr_threshold = self._m.snr_threshold
         min_width_seconds = self._m.min_width_seconds
         min_distance_seconds = self._m.min_distance_seconds
@@ -532,19 +1950,51 @@ class GCAnalyzer:
             noise_sigma = np.std(intensity) * 0.01
             self.audit.warn("PeakDetection", "noise_sigma ≤ 0 após MAD — usando 1% do desvio padrão.", noise_sigma=noise_sigma)
         dynamic_prominence = snr_threshold * noise_sigma
-        from scipy.ndimage import gaussian_filter1d
 
-        smoothed = gaussian_filter1d(intensity, sigma=3)
+        # ── Suavização Savitzky-Golay (substitui gaussian_filter1d) ───────────
+        # O SG preserva altura e FWHM dos picos, essenciais para calcular N.
+        sg_wl = self._m.sg_window_length
+        sg_po = self._m.sg_polyorder
+
+        if sg_wl == 0:
+            # Estimativa automática: pré-detecção rápida para medir largura média
+            _pre_peaks, _ = _scipy_find_peaks(intensity, prominence=dynamic_prominence, distance=min_distance_pts)
+            if len(_pre_peaks) > 0:
+                _widths_pts, *_ = peak_widths(intensity, _pre_peaks, rel_height=0.5)
+                avg_width_pts = float(np.median(_widths_pts))
+            else:
+                avg_width_pts = max(min_width_pts, 5)
+            sg_wl = max(5, int(np.round(1.5 * avg_width_pts)))
+            if sg_wl % 2 == 0:  # garante ímpar
+                sg_wl += 1
+            self.audit.info(
+                "PeakDetection",
+                f"sg_window_length=0 (auto) → estimado como {sg_wl} pts " f"(1.5 × largura_média={avg_width_pts:.1f} pts).",
+                avg_width_pts=avg_width_pts,
+                sg_window_length_auto=sg_wl,
+            )
+
+        # Salvaguarda: polyorder deve ser < window_length
+        sg_po = min(sg_po, sg_wl - 1)
+        if sg_wl % 2 == 0:
+            sg_wl += 1  # garantia extra de paridade
+
+        smoothed = _savgol_filter(intensity, window_length=sg_wl, polyorder=sg_po)
         d1 = np.gradient(smoothed, rt)
         d2 = np.gradient(d1, rt)
+
         self.audit.info(
             "PeakDetection",
-            f"Parâmetros de detecção: dt={dt:.4f}s, min_width={min_width_pts}pts, min_dist={min_distance_pts}pts, prominence≥{dynamic_prominence:.2f}.",
+            f"Parâmetros de detecção: dt={dt:.4f}s, min_width={min_width_pts}pts, "
+            f"min_dist={min_distance_pts}pts, prominence≥{dynamic_prominence:.2f}, "
+            f"SG(window={sg_wl}, poly={sg_po}).",
             dt=dt,
             min_width_pts=min_width_pts,
             min_distance_pts=min_distance_pts,
             prominence=dynamic_prominence,
             snr_threshold=snr_threshold,
+            sg_window_length=sg_wl,
+            sg_polyorder=sg_po,
         )
         peaks, _ = _scipy_find_peaks(intensity, prominence=dynamic_prominence, distance=min_distance_pts, width=min_width_pts)
         if len(peaks) == 0:
@@ -559,8 +2009,37 @@ class GCAnalyzer:
                 },
             )
         widths, _, left_ips, right_ips = peak_widths(intensity, peaks, rel_height=0.95)
-        left_base = np.maximum(0, np.floor(left_ips)).astype(int)
-        right_base = np.minimum(len(intensity) - 1, np.ceil(right_ips)).astype(int)
+        # left_ips/right_ips (float) são usados apenas para a validação de
+        # sigma_est abaixo.  left_base/right_base (int) que alimentam a
+        # integração são calculados pelo critério slope-to-slope quando ativo,
+        # recorrendo a peak_widths como fallback de segurança.
+        fb_left = np.maximum(0, np.floor(left_ips)).astype(int)
+        fb_right = np.minimum(len(intensity) - 1, np.ceil(right_ips)).astype(int)
+
+        stf = self._m.slope_threshold_factor
+        if stf > 0.0:
+            # Limiar absoluto: proporcional ao ruído e inversamente ao passo de
+            # tempo, para ficar nas mesmas unidades de d1 (intensidade/s).
+            slope_threshold = stf * noise_sigma / dt
+            left_base = np.empty(len(peaks), dtype=int)
+            right_base = np.empty(len(peaks), dtype=int)
+            for i, p in enumerate(peaks):
+                lb, rb = self._slope_to_slope_bounds(
+                    d1, int(p), int(fb_left[i]), int(fb_right[i]), slope_threshold, len(intensity)
+                )
+                left_base[i] = lb
+                right_base[i] = rb
+            self.audit.info(
+                "PeakDetection",
+                f"Slope-to-slope ativo: limiar={slope_threshold:.4f} u.a./s "
+                f"(factor={stf}, σ_ruído={noise_sigma:.4f}, dt={dt:.4f}s).",
+                slope_threshold=slope_threshold,
+                slope_threshold_factor=stf,
+            )
+        else:
+            left_base = fb_left
+            right_base = fb_right
+            self.audit.info("PeakDetection", "Slope-to-slope desativado (factor=0) → usando peak_widths 95%.")
         max_reasonable_sigma = 10
         valid = []
         for i, p in enumerate(peaks):
@@ -595,6 +2074,43 @@ class GCAnalyzer:
             msg = f"Todos os picos foram rejeitados pelo filtro de SNR local < {snr_threshold}."
             self.audit.warn("PeakDetection", msg, snr_threshold=snr_threshold)
             raise PeakDetectionError(msg, context={"snr_threshold": snr_threshold})
+
+        # ── integration_inhibit_windows: remove picos dentro das janelas ──────
+        inhibit_windows = self._m.integration_inhibit_windows
+        if inhibit_windows:
+            inhibit_mask = np.ones(len(peaks), dtype=bool)  # True = manter
+            for t0, t1 in inhibit_windows:
+                for k, p in enumerate(peaks):
+                    apex_rt = float(rt[p])
+                    if t0 <= apex_rt <= t1:
+                        inhibit_mask[k] = False
+                        self.audit.decision(
+                            "PeakDetection",
+                            f"Pico em RT={apex_rt:.2f}s descartado pela janela de inibição [{t0:.2f}–{t1:.2f}s].",
+                            original_value="DETECTED",
+                            new_value="INHIBITED",
+                            apex_rt=apex_rt,
+                            inhibit_window=(t0, t1),
+                        )
+            n_inhibited = int((~inhibit_mask).sum())
+            if n_inhibited:
+                self.audit.info(
+                    "PeakDetection",
+                    f"{n_inhibited} pico(s) suprimido(s) por integration_inhibit_windows.",
+                    n_inhibited=n_inhibited,
+                    windows=inhibit_windows,
+                )
+            peaks = peaks[inhibit_mask]
+            left_ips = left_ips[inhibit_mask]
+            right_ips = right_ips[inhibit_mask]
+            left_base = left_base[inhibit_mask]
+            right_base = right_base[inhibit_mask]
+            snr_values = snr_values[inhibit_mask]
+            if len(peaks) == 0:
+                msg = "Todos os picos foram suprimidos pelas janelas de inibição."
+                self.audit.warn("PeakDetection", msg, inhibit_windows=inhibit_windows)
+                raise PeakDetectionError(msg, context={"inhibit_windows": inhibit_windows})
+
         self.audit.log_peaks_found(n=len(peaks), rts=[round(float(rt[p]), 2) for p in peaks])
         return peaks, left_ips, right_ips, snr_values, left_base, right_base
 
@@ -627,6 +2143,66 @@ class GCAnalyzer:
         return y
 
     # ==========================================================
+    # 5️⃣b CHUTE INICIAL VIA MOMENTOS ESTATÍSTICOS
+    # ==========================================================
+    @staticmethod
+    def _emg_moments_p0(x: np.ndarray, y: np.ndarray, peak_rt: float) -> tuple[float, float, float, float]:
+        """Calcula p0=[A, mu, sigma, tau] para o fit EMG a partir dos momentos
+        estatísticos do segmento de pico.
+
+        Relações usadas (distribuição EMG):
+            m₁  = mu + tau                      (média)
+            m₂  = sigma² + tau²                 (variância)
+            γ₁  = 2·tau³ / (sigma²+tau²)^(3/2) (assimetria de Fisher)
+
+        Inversão:
+            r   = clip(γ₁/2, 0, 1)^(1/3)
+            tau = r · sqrt(m₂)
+            sigma = sqrt(max(m₂ - tau², ε²))
+            mu  = m₁ - tau
+        """
+        w = np.maximum(y, 0.0)
+        w_sum = w.sum()
+
+        # Área pelo trapézio (p0 para A)
+        A0 = float(trapezoid(y, x))
+        if A0 <= 0:
+            A0 = float(w_sum * (x[-1] - x[0]) / max(len(x) - 1, 1))
+
+        if w_sum <= 0:
+            # Fallback seguro se o sinal for todo zero
+            span = float(x[-1] - x[0])
+            sigma0 = max(span / 6.0, 0.01)
+            return A0, float(peak_rt), sigma0, sigma0
+
+        # Momento 1: centroide
+        m1 = float(np.dot(x, w) / w_sum)
+
+        # Momento 2: variância
+        dx = x - m1
+        m2 = float(np.dot(dx**2, w) / w_sum)
+        m2 = max(m2, 1e-6)
+
+        # Momento 3: assimetria de Fisher (γ₁)
+        m3_raw = float(np.dot(dx**3, w) / w_sum)
+        gamma1 = m3_raw / (m2**1.5)
+        # Para CG com tailing, γ₁ > 0; valores negativos → pico simétrico
+        gamma1 = float(np.clip(gamma1, 0.0, 1.999))
+
+        # Inversão analítica
+        r = (gamma1 / 2.0) ** (1.0 / 3.0)  # r = tau / sqrt(m2)
+        tau0 = r * np.sqrt(m2)
+        sigma0_sq = m2 - tau0**2
+        sigma0 = float(np.sqrt(max(sigma0_sq, 1e-6)))
+        tau0 = float(max(tau0, 0.001))
+        sigma0 = float(max(sigma0, 0.001))
+
+        # mu EMG: média observada é mu + tau
+        mu0 = float(np.clip(m1 - tau0, x[0], x[-1]))
+
+        return A0, mu0, sigma0, tau0
+
+    # ==========================================================
     # 6️⃣  AJUSTE EMG
     # ==========================================================
     def fit_emg_peak(self, rt, intensity, peak_idx, left, right):
@@ -642,10 +2218,19 @@ class GCAnalyzer:
             return None
         area_trap, _, y_above, _ = self.integrate_trapezoid_segment(rt, intensity, left, right)
         height_above_bl = float(np.max(y_above)) if len(y_above) > 0 else 0.0
-        A0 = trapezoid(y, x)
-        mu0 = rt[peak_idx]
-        sigma0 = max((rt[right] - rt[left]) / 6, 0.01)
-        tau0 = sigma0
+
+        # ── Chute inicial via momentos estatísticos ───────────────────────────
+        A0, mu0, sigma0, tau0 = self._emg_moments_p0(x, y, peak_rt=float(rt[peak_idx]))
+        self.audit.info(
+            "Integration",
+            f"p0 EMG (momentos): A={A0:.2f}, mu={mu0:.4f}s, σ={sigma0:.4f}s, τ={tau0:.4f}s " f"[RT_apex={rt[peak_idx]:.4f}s].",
+            rt=float(rt[peak_idx]),
+            p0_A=A0,
+            p0_mu=mu0,
+            p0_sigma=sigma0,
+            p0_tau=tau0,
+        )
+
         emg_params = {}
         try:
             popt, _ = curve_fit(
@@ -1182,6 +2767,141 @@ class GCAnalyzer:
         return filtered.reset_index(drop=True)
 
     # ==========================================================
+    # 9️⃣b  INTEGRAÇÃO FORÇADA POR JANELA
+    # ==========================================================
+    def _run_forced_integrations(self, rt: np.ndarray, intensity: np.ndarray) -> list[dict]:
+        """Integra regiões definidas explicitamente pelo usuário em
+        ``ProcessingMethod.force_integration_windows``, independente da
+        detecção automática.
+
+        Para cada janela ``(t_start, t_end)``:
+          1. Fatia ``rt`` e ``intensity`` para o intervalo especificado.
+          2. Localiza o ápice como ``argmax`` dentro do segmento.
+          3. Converte os índices do segmento para índices globais do array
+             original (necessário para ``estimate_local_snr``).
+          4. Chama ``fit_emg_peak`` com os limites da janela como fronteiras
+             de integração.
+          5. Marca o resultado com ``integration_method = 'FORCED'`` e o flag
+             booleano ``forced = True`` para rastreabilidade downstream.
+
+        Janelas fora do intervalo de ``rt``, com menos de 5 pontos ou onde
+        ``fit_emg_peak`` retorna ``None`` recebem um ``WARN`` e são ignoradas
+        sem interromper o pipeline.
+
+        Retorna lista de dicts prontos para concatenar ao DataFrame principal.
+        """
+        windows = self._m.force_integration_windows
+        if not windows:
+            return []
+
+        forced_rows: list[dict] = []
+
+        for t_start, t_end in windows:
+            if t_start >= t_end:
+                self.audit.warn(
+                    "ForcedIntegration",
+                    f"Janela inválida ignorada: t_start={t_start:.3f} >= t_end={t_end:.3f}.",
+                    t_start=t_start,
+                    t_end=t_end,
+                )
+                continue
+
+            # ── Índices globais da janela ─────────────────────────────────────
+            mask = (rt >= t_start) & (rt <= t_end)
+            indices = np.where(mask)[0]
+
+            if len(indices) < 5:
+                self.audit.warn(
+                    "ForcedIntegration",
+                    f"Janela [{t_start:.3f}–{t_end:.3f}s] ignorada: " f"apenas {len(indices)} ponto(s) (mínimo: 5).",
+                    t_start=t_start,
+                    t_end=t_end,
+                    n_pts=len(indices),
+                )
+                continue
+
+            left_idx = int(indices[0])
+            right_idx = int(indices[-1])
+
+            # Ápice: argmax da intensidade dentro da janela (índice global)
+            apex_local = int(np.argmax(intensity[left_idx : right_idx + 1]))
+            apex_idx = left_idx + apex_local
+
+            self.audit.info(
+                "ForcedIntegration",
+                f"Integrando janela forçada [{t_start:.3f}–{t_end:.3f}s]: "
+                f"ápice em RT={rt[apex_idx]:.4f}s (idx={apex_idx}), "
+                f"{len(indices)} ponto(s).",
+                t_start=t_start,
+                t_end=t_end,
+                apex_rt=float(rt[apex_idx]),
+                apex_idx=apex_idx,
+                n_pts=len(indices),
+            )
+
+            row = self.fit_emg_peak(rt, intensity, apex_idx, left_idx, right_idx)
+
+            if row is None:
+                self.audit.warn(
+                    "ForcedIntegration",
+                    f"fit_emg_peak retornou None para janela [{t_start:.3f}–{t_end:.3f}s] "
+                    f"(menos de 5 pts no segmento interno após fatiamento).",
+                    t_start=t_start,
+                    t_end=t_end,
+                )
+                continue
+
+            # SNR local usando os limites reais da janela
+            snr, _, noise = self.estimate_local_snr(rt, intensity, apex_idx, left_idx, right_idx)
+            row["snr"] = snr
+            row["local_noise"] = noise
+            row["integration_method"] = "FORCED"
+            row["forced"] = True
+            row["forced_window"] = (t_start, t_end)
+            row["valley_pct"] = np.nan
+            row["height_ratio"] = np.nan
+            row["Rs"] = np.nan
+
+            # Remove chaves internas de skim (não se aplica a picos forçados)
+            row.pop("_skim_x", None)
+            row.pop("_skim_tangent", None)
+
+            self.audit.decision(
+                "ForcedIntegration",
+                f"Pico forçado integrado: RT={row['rt']:.4f}s, " f"área={row['area']:.2f}, SNR={snr:.2f}.",
+                original_value="NOT_DETECTED",
+                new_value="FORCED",
+                rt=row["rt"],
+                area=row["area"],
+                snr=snr,
+                t_start=t_start,
+                t_end=t_end,
+            )
+            forced_rows.append(row)
+
+        return forced_rows
+
+    @staticmethod
+    def _peak_method_label(peak_dict: dict) -> str:
+        """Retorna o label correto do método de integração.
+
+        'EMG'       → o ajuste EMG convergiu; os parâmetros A, sigma, tau são
+                      válidos e a curva ajustada descreve o pico.
+        'TRAPEZOID' → o ajuste EMG falhou (A_param é NaN); a área reportada é
+                      puramente trapezoidal sem modelo de forma.
+
+        Centralizar essa lógica aqui evita o bug silencioso de rotular como
+        'EMG' picos cujo fit não convergiu.
+        """
+        a = peak_dict.get("A_param")
+        try:
+            if a is not None and float(a) == float(a):  # não-NaN
+                return "EMG"
+        except (TypeError, ValueError):
+            pass
+        return "TRAPEZOID"
+
+    # ==========================================================
     # 🔟  PIPELINE DE INTEGRAÇÃO COMPLETO
     # ==========================================================
     def integrate(self, rt, intensity):
@@ -1228,7 +2948,7 @@ class GCAnalyzer:
                                 )
                                 row["snr"] = snr
                                 row["local_noise"] = noise
-                                row["integration_method"] = "EMG"
+                                row["integration_method"] = self._peak_method_label(row)
                                 overlap.append(row)
                     elif method == "DROP_LINE":
                         overlap = self.integrate_dropline(
@@ -1269,7 +2989,7 @@ class GCAnalyzer:
                 snr, _, noise = self.estimate_local_snr(rt, intensity, peaks[i], int(left_base[i]), int(right_base[i]))
                 peak_result["snr"] = snr
                 peak_result["local_noise"] = noise
-                peak_result["integration_method"] = "EMG"
+                peak_result["integration_method"] = self._peak_method_label(peak_result)
                 peak_result["valley_pct"] = np.nan
                 peak_result["height_ratio"] = np.nan
                 peak_result["Rs"] = np.nan
@@ -1292,6 +3012,13 @@ class GCAnalyzer:
             clean_results.append(row)
 
         df = pd.DataFrame(clean_results)
+
+        # Constrói um dict apex_idx → skim_trace para sobreviver a reordenações
+        # do DataFrame (concat, sort_values) sem perder o alinhamento posicional.
+        _skim_by_apex: dict[int, object] = {}
+        if "peak_index_apex" in df.columns:
+            for apex_idx, skim in zip(df["peak_index_apex"].tolist(), self._skim_traces):
+                _skim_by_apex[int(apex_idx)] = skim
 
         # ── ✅ FIX 2: Detecta o IS ANTES de remove_solvent_peak ──────────────
         # Problema original: integrate() chamava remove_solvent_peak() sem passar
@@ -1322,6 +3049,75 @@ class GCAnalyzer:
                 )
 
         df = self.remove_solvent_peak(df, protected_rt=protected_is_rt)
+
+        # ── min_area_threshold: descarta picos fantasmas por área absoluta ────
+        min_area = self._m.min_area_threshold
+        if min_area > 0.0 and not df.empty:
+            before_area = len(df)
+            area_mask = df["area"] >= min_area
+            n_rejected_area = int((~area_mask).sum())
+            if n_rejected_area:
+                rejected_rts = df.loc[~area_mask, "rt"].round(2).tolist()
+                self.audit.decision(
+                    "QC",
+                    f"{n_rejected_area} pico(s) descartado(s) por área < {min_area:.2f} "
+                    f"(min_area_threshold): RT={rejected_rts}.",
+                    original_value=before_area,
+                    new_value=before_area - n_rejected_area,
+                    min_area_threshold=min_area,
+                    rejected_rts=rejected_rts,
+                )
+                df = df[area_mask].reset_index(drop=True)
+            else:
+                self.audit.info(
+                    "QC",
+                    f"min_area_threshold={min_area:.2f}: todos os picos aprovaram o filtro de área.",
+                    min_area_threshold=min_area,
+                )
+
+        # ── expected_peaks_count: alerta de QC por contagem de picos ──────────
+        # Integração forçada é adicionada AQUI — depois de todos os filtros
+        # automáticos (remove_solvent_peak, min_area_threshold) para que os picos
+        # forçados não distorçam a mediana nem sejam silenciados por esses filtros.
+        # Eles entram na contagem final e no expected_peaks_count.
+        forced_rows = self._run_forced_integrations(rt, intensity)
+        if forced_rows:
+            df_forced = pd.DataFrame(forced_rows)
+            df = pd.concat([df, df_forced], ignore_index=True).sort_values("rt").reset_index(drop=True)
+            self.audit.info(
+                "Pipeline",
+                f"{len(forced_rows)} pico(s) forçado(s) adicionado(s) ao relatório final.",
+                n_forced=len(forced_rows),
+                forced_rts=[round(r["rt"], 3) for r in forced_rows],
+            )
+
+        # Reconstrói _skim_traces alinhado com a ordem final do DataFrame.
+        # Usa o dict _skim_by_apex (keyed por peak_index_apex) construído antes
+        # dos filtros, portanto imune a reordenações por sort_values ou concat.
+        if "peak_index_apex" in df.columns:
+            self._skim_traces = [_skim_by_apex.get(int(apex), None) for apex in df["peak_index_apex"]]
+        else:
+            self._skim_traces = [None] * len(df)
+
+        expected = self._m.expected_peaks_count
+        if expected is not None:
+            n_found = len(df)
+            if n_found != expected:
+                self.audit.warn(
+                    "QC",
+                    f"Contagem de picos diverge do esperado: encontrados={n_found}, "
+                    f"esperados={expected} (delta={n_found - expected:+d}).",
+                    expected_peaks_count=expected,
+                    found_peaks_count=n_found,
+                    delta=n_found - expected,
+                )
+            else:
+                self.audit.info(
+                    "QC",
+                    f"Contagem de picos OK: {n_found} pico(s) encontrado(s) == {expected} esperado(s).",
+                    expected_peaks_count=expected,
+                    found_peaks_count=n_found,
+                )
 
         self.audit.info("Pipeline", f"Integração concluída: {len(df)} pico(s) no relatório final.", n_peaks_final=len(df))
         return df
@@ -2145,18 +3941,30 @@ class GCAnalyzer:
             "DECONVOLUTION": "mediumpurple",
             "TANGENT_SKIM_PARENT": "darkorange",
             "TANGENT_SKIM_RIDER": "tomato",
+            "FORCED": "limegreen",
+            "TRAPEZOID": "gray",
         }
-        first_flags = {k: True for k in METHOD_COLOR}
-        first_area = {k: True for k in METHOD_COLOR}
+        # first_flags/first_area inicializam para qualquer método que apareça,
+        # inclusive os adicionados pelo usuário ou futuros — usa defaultdict.
+        from collections import defaultdict
+
+        first_flags: dict[str, bool] = defaultdict(lambda: True)
+        first_area: dict[str, bool] = defaultdict(lambda: True)
         first_gauss = True
         first_g_area = True
-        skim_traces = getattr(self, "_skim_traces", [None] * len(results_df))
-        if len(skim_traces) != len(results_df):
+
+        skim_traces = getattr(self, "_skim_traces", None)
+        if skim_traces is None or len(skim_traces) != len(results_df):
             skim_traces = [None] * len(results_df)
+
         for (idx, row), skim in zip(results_df.iterrows(), skim_traces):
             method = row.get("integration_method", "EMG")
-            color = METHOD_COLOR.get(method, "gray")
-            if method != "TANGENT_SKIM_RIDER" and all(k in row and pd.notna(row[k]) for k in ["A_param", "sigma", "tau"]):
+            color = METHOD_COLOR.get(method, "slategray")
+
+            has_emg = all(k in row and pd.notna(row[k]) for k in ["A_param", "sigma", "tau"])
+
+            if method != "TANGENT_SKIM_RIDER" and has_emg:
+                # ── Curva EMG ajustada ────────────────────────────────────────
                 emg_curve = self.emg(rt, row["A_param"], row["rt"], row["sigma"], row["tau"])
                 label = f"{method} Fit"
                 fig.add_trace(
@@ -2186,6 +3994,37 @@ class GCAnalyzer:
                 )
                 first_flags[method] = False
                 first_area[method] = False
+
+            # ── Área trapezoidal: sempre pintada, independente do EMG ─────────
+            # Para EMG bem-sucedido aparece como camada subjacente (opacidade baixa).
+            # Para TRAPEZOID/FORCED ou quando EMG falhou, é a única representação.
+            if method != "TANGENT_SKIM_RIDER":
+                i_start = row.get("peak_index_start")
+                i_end = row.get("peak_index_end")
+                if i_start is not None and i_end is not None and pd.notna(i_start) and pd.notna(i_end):
+                    i_start, i_end = int(i_start), int(i_end)
+                    x_seg = rt[i_start:i_end]
+                    y_seg = corrected[i_start:i_end]
+                    if len(x_seg) >= 2:
+                        y_bl = np.linspace(float(y_seg[0]), float(y_seg[-1]), len(x_seg))
+                        # Opacidade menor quando EMG já está visível, maior quando é a única representação
+                        trap_opacity = 0.07 if has_emg else 0.22
+                        label_trap = "Trapezoid Area"
+                        fig.add_trace(
+                            go.Scatter(
+                                x=np.concatenate([x_seg, x_seg[::-1]]),
+                                y=np.concatenate([y_seg, y_bl[::-1]]),
+                                mode="lines",
+                                fill="toself",
+                                name=label_trap if first_area["TRAPEZOID_FILL"] else None,
+                                legendgroup=label_trap,
+                                showlegend=first_area["TRAPEZOID_FILL"],
+                                line=dict(width=0, color=color),
+                                opacity=trap_opacity,
+                            )
+                        )
+                        first_area["TRAPEZOID_FILL"] = False
+
             if skim is not None:
                 skim_x, skim_tan = skim
                 fig.add_trace(
@@ -2199,6 +4038,7 @@ class GCAnalyzer:
                         line=dict(width=2, color="gold", dash="dashdot"),
                     )
                 )
+
             if all(k in row and pd.notna(row[k]) for k in ["gauss_A", "gauss_mu", "gauss_sigma"]):
                 gauss_curve = self.gaussian(rt, row["gauss_A"], row["gauss_mu"], row["gauss_sigma"])
                 fig.add_trace(
@@ -2228,6 +4068,7 @@ class GCAnalyzer:
                 )
                 first_gauss = False
                 first_g_area = False
+
         if not results_df.empty:
             snr_text = []
             for _, row in results_df.iterrows():
@@ -2235,7 +4076,8 @@ class GCAnalyzer:
                 snr = row.get("snr", np.nan)
                 v_pct = row.get("valley_pct", np.nan)
                 area = row.get("area", np.nan)
-                label = f"{method}<br>SNR={snr:.1f}" if pd.notna(snr) else method
+                forced = row.get("forced") is True  # NaN e False → sem bandeirinha
+                label = f"{'⚑ ' if forced else ''}{method}<br>SNR={snr:.1f}" if pd.notna(snr) else method
                 if pd.notna(v_pct):
                     label += f"<br>%V={v_pct:.0f}%"
                 if pd.notna(area):
@@ -2306,6 +4148,10 @@ method_single = ProcessingMethod(
     cqi_n_ref=5000.0,  # N de referência para normalização no CQI.
     cqi_rs_ref=1.5,  # Rs mínimo aceitável para normalização no CQI.
     cqi_snr_ref=10.0,  # SNR de referência para normalização no CQI.
+    force_integration_windows=[
+        (245.0, 252.0),
+        (310.5, 315.0),
+    ],  # Janelas de RT forçadas para integração (mesmo que sem pico detectado).
 )
 
 # Salve o método em JSON para reutilização (opcional, mas recomendado para rastreabilidade).
@@ -2448,3 +4294,39 @@ if len([r for r in results_batch if r.ok]) >= 2:
 
 # Exporte o audit trail do lote (inclui eventos de todas as corridas).
 audit_batch = gc_batch.export_audit(path_json="audit_batch_ext.json", path_csv="audit_batch_ext.csv")
+
+
+analyzer = GCAnalyzer()
+rpt = GCReport(
+    analyzer,
+    title="Análise de Terpenóides",
+    analyst="Dr. Silva",
+    lab="Laboratório QC",
+    instrument="Agilent 7890B — FID",
+    sample_info="Lote BX-2024-011",
+)
+
+
+cdf_path_single = r"C:\Users\BDanielS\Desktop\UFMG\Vault\Doutorado\Codigos\data\gc-data\Testes\cdf\T1.CDF"
+cdf_path_single2 = r"C:\Users\BDanielS\Desktop\UFMG\Vault\Doutorado\Codigos\data\gc-data\Testes\cdf\T2.CDF"
+cdf_path_single3 = r"C:\Users\BDanielS\Desktop\UFMG\Vault\Doutorado\Codigos\data\gc-data\Testes\cdf\T3.CDF"
+rt, raw = analyzer.read_cdf(cdf_path_single)
+rt2, raw2 = analyzer.read_cdf(cdf_path_single2)
+rt3, raw3 = analyzer.read_cdf(cdf_path_single3)
+
+corrected, baseline = analyzer.remove_baseline(rt, raw)
+corrected2, baseline2 = analyzer.remove_baseline(rt2, raw2)
+corrected3, baseline3 = analyzer.remove_baseline(rt3, raw3)
+
+results_df = analyzer.integrate(rt, corrected)
+results_df2 = analyzer.integrate(rt2, corrected2)
+results_df3 = analyzer.integrate(rt3, corrected3)
+
+results_df = analyzer.compute_usp_metrics(rt, corrected, results_df)
+results_df2 = analyzer.compute_usp_metrics(rt2, corrected2, results_df2)
+results_df3 = analyzer.compute_usp_metrics(rt3, corrected3, results_df3)
+
+rpt.add_run(rt, raw, corrected, baseline, results_df, label="Réplica 1")
+rpt.add_run(rt2, raw2, corrected2, baseline2, results_df2, label="Réplica 2")
+rpt.add_run(rt3, raw3, corrected3, baseline3, results_df3, label="Réplica 3")
+rpt.build("relatorio2.pdf")
