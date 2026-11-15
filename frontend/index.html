@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Chromatogram Viewer</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Barra Lateral Esquerda: Amostras e Ações Gerais -->
+        <aside class="sidebar left-sidebar" id="sidebar">
+            <div class="toolbar">
+                <input type="file" id="file-input" multiple accept=".cdf" hidden>
+
+                <!-- Linha 1: Adicionar, Excluir, Noturno -->
+                <button id="upload-btn" class="btn btn-primary" title="Adicionar arquivos .CDF">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        stroke-width="2.5">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                    </svg>
+                </button>
+
+                <button id="clear-btn" class="btn btn-ghost danger" title="Limpar tudo">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path
+                            d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    </svg>
+                </button>
+
+                <button id="theme-btn" class="btn btn-ghost" title="Alternar Modo Claro/Escuro">
+                    <span id="theme-icon">🌙</span>
+                </button>
+
+                <!-- Linha 2: Integrar (Atalho: F), Tabela, Colapsar Esquerda -->
+                <button id="integrate-btn" class="btn btn-ghost" title="Integração Manual (Atalho: F)">
+                    <span style="font-size: 15px; font-weight: bold; font-style: italic;">∫</span>
+                </button>
+
+                <button id="region-remove-btn" class="btn btn-ghost" title="Remover picos por região">
+                    <span style="font-size: 14px;">🧹</span>
+                </button>
+
+                <button id="ms-avg-btn" class="btn btn-ghost" style="display: none;"
+                    title="Espectro médio: escolha o início e o fim de um intervalo no cromatograma">
+                    <span style="font-size: 15px; font-weight: bold; text-decoration: overline;">x</span>
+                </button>
+
+                <button id="ms-eic-btn" class="btn btn-ghost" style="display: none;"
+                    title="Cromatograma de íon extraído (EIC): mostra só os m/z escolhidos ao longo do tempo">
+                    <span style="font-size: 11px; font-weight: 700;">EIC</span>
+                </button>
+
+                <button id="toggle-table-btn" class="btn btn-ghost" title="Tabela de Picos">
+                    <span style="font-size: 14px;">📊</span>
+                </button>
+
+                <button id="collapse-btn" class="btn btn-ghost" title="Ocultar barra lateral esquerda">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="11 17 6 12 11 7"></polyline>
+                        <polyline points="18 17 13 12 18 7"></polyline>
+                    </svg>
+                </button>
+
+                <!-- Linha 3: Bloco de Notas e Rampa de Temperatura -->
+                <button id="notes-btn" class="btn btn-ghost" title="Bloco de Notas do Projeto">
+                    <span style="font-size: 14px;">📝</span>
+                </button>
+
+                <button id="temp-ramp-btn" class="btn btn-ghost" title="Rampa de Temperatura (Forno)">
+                    <span style="font-size: 14px;">🌡️</span>
+                </button>
+
+                <button id="align-btn" class="btn btn-ghost" title="Alinhar e normalizar corridas">
+                    <span style="font-size: 15px; font-weight: bold;">⇄</span>
+                </button>
+
+                <button id="compounds-btn" class="btn btn-ghost"
+                    title="Compostos: lista reutilizável e matriz compostos × corridas">
+                    <span style="font-size: 14px;">🧪</span>
+                </button>
+            </div>
+
+            <div class="sample-section">
+                <div class="sample-header">Amostras (<span id="sample-count">0</span>)</div>
+                <ul id="sample-list"></ul>
+            </div>
+
+            <!-- Seletor de modo (canto inferior) -->
+            <div class="mode-switch" id="mode-switch">
+                <button class="mode-btn active" id="mode-gcfid" data-mode="gcfid" title="Modo GC-FID">GC-FID</button>
+                <button class="mode-btn" id="mode-gcms" data-mode="gcms" title="Modo GC-MS">GC-MS</button>
+            </div>
+        </aside>
+
+        <div class="resizer" id="resizer"></div>
+
+        <!-- Área Principal do Gráfico -->
+        <main class="chart-container" id="chart-area">
+            <button id="expand-btn" class="btn-expand" title="Mostrar barra lateral">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="13 17 18 12 13 7"></polyline>
+                    <polyline points="6 17 11 12 6 7"></polyline>
+                </svg>
+            </button>
+
+            <!-- Botão Ícone 📁 abaixo da toolbar do Plotly -->
+            <button id="toggle-projects-panel-btn" class="btn-toggle-projects-icon" title="Diretório de Projetos">
+                📁
+            </button>
+
+            <!-- Banner Minimalista -->
+            <div id="integration-banner" class="integration-banner" style="display: none;">
+                <span class="banner-pulse"></span>
+                <span id="banner-text">Início do pico</span>
+                <button id="banner-cancel-btn" class="btn-banner-cancel">✕</button>
+            </div>
+
+            <!-- Dupla Linha Tracejada + Tooltip -->
+            <div id="crosshair-v" class="crosshair-line-v" style="display: none;"></div>
+            <div id="crosshair-h" class="crosshair-line-h" style="display: none;"></div>
+            <div id="crosshair-tooltip" class="crosshair-tooltip" style="display: none;"></div>
+
+            <div id="plot"></div>
+
+            <!-- Menu de Contexto (Botão Direito) -->
+            <div id="context-menu" class="context-menu" style="display: none;">
+                <div class="context-group">
+                    <label class="context-radio">
+                        <input type="radio" name="y-axis-mode" value="raw" id="y-mode-raw" checked>
+                        <span>Y: Intensidade (u.a.)</span>
+                    </label>
+                    <label class="context-radio">
+                        <input type="radio" name="y-axis-mode" value="percent" id="y-mode-percent">
+                        <span>Y: Intensidade (%)</span>
+                    </label>
+                </div>
+
+                <div class="context-divider"></div>
+                <div class="context-section-title">VISUALIZAÇÃO</div>
+
+                <button class="context-item-btn" id="ctx-reset-zoom">🔍 Redefinir zoom</button>
+
+                <div class="context-limits-row">
+                    <span>Lim X:</span>
+                    <input type="number" id="ctx-lim-x-min" placeholder="min" class="ctx-input">
+                    <span>—</span>
+                    <input type="number" id="ctx-lim-x-max" placeholder="max" class="ctx-input">
+                </div>
+
+                <div class="context-limits-row">
+                    <span>Lim Y:</span>
+                    <input type="number" id="ctx-lim-y-min" placeholder="min" class="ctx-input">
+                    <span>—</span>
+                    <input type="number" id="ctx-lim-y-max" placeholder="max" class="ctx-input">
+                </div>
+
+                <button class="context-item-btn" id="ctx-reset-xy">↺ Reset X / Y</button>
+
+                <div class="context-divider fid-only"></div>
+                <div class="context-section-title fid-only">CROMATOGRAMAS</div>
+
+                <div class="context-offset-row fid-only">
+                    <span>Offset Y:</span>
+                    <input type="number" id="ctx-offset-y" value="0" step="500" class="ctx-input-number">
+                </div>
+            </div>
+
+            <!-- Modal de Integração Forçada -->
+            <div class="modal-forced-integration" id="integration-modal" style="display: none;">
+                <div class="modal-header" id="modal-drag-handle">
+                    <div class="modal-title">⏰ Integração Forçada</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="modal-minimize-btn" title="Minimizar">_</button>
+                        <button class="modal-icon-btn" id="modal-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body" id="modal-body-content">
+                    <div class="control-row">
+                        <span class="control-label">INÍCIO</span>
+                        <div class="control-group">
+                            <div class="nudge-bar">
+                                <button class="btn-nudge" id="start-step-back-10">◄◄</button>
+                                <button class="btn-nudge" id="start-step-back-1">◄</button>
+                                <input type="range" class="control-slider" id="start-slider" min="0" max="100"
+                                    value="20">
+                                <button class="btn-nudge" id="start-step-fwd-1">►</button>
+                                <button class="btn-nudge" id="start-step-fwd-10">►►</button>
+                            </div>
+                            <div class="control-feedback">
+                                <span id="start-idx-feedback">0 / 0</span>
+                                <span id="start-time-feedback">0.0000 s</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-row">
+                        <span class="control-label">FIM</span>
+                        <div class="control-group">
+                            <div class="nudge-bar">
+                                <button class="btn-nudge" id="end-step-back-10">◄◄</button>
+                                <button class="btn-nudge" id="end-step-back-1">◄</button>
+                                <input type="range" class="control-slider" id="end-slider" min="0" max="100" value="30">
+                                <button class="btn-nudge" id="end-step-fwd-1">►</button>
+                                <button class="btn-nudge" id="end-step-fwd-10">►►</button>
+                            </div>
+                            <div class="control-feedback">
+                                <span id="end-idx-feedback">0 / 0</span>
+                                <span id="end-time-feedback">0.0000 s</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-row">
+                        <span class="control-label">NOME</span>
+                        <input type="text" id="peak-name-input" class="modal-input"
+                            placeholder="Nome do pico (opcional)">
+                    </div>
+
+                    <div class="control-row">
+                        <span class="control-label">BASELINE</span>
+                        <select id="baseline-type-select" class="modal-select">
+                            <option value="Valley-to-Valley">Valley-to-Valley</option>
+                            <option value="Drop Line">Drop Line</option>
+                            <option value="Tangent Skim">Tangent Skim</option>
+                        </select>
+                        <span class="info-icon" id="dropline-info" style="display: none;" tabindex="0"
+                            data-tip="Drop Line: só este pico é recalculado; os outros picos do grupo mantêm seus próprios parâmetros.">i</span>
+                    </div>
+
+                    <div id="dropline-controls" style="display: none;">
+                        <div class="control-row">
+                            <span class="control-label">GL.INÍCIO</span>
+                            <div class="control-group">
+                                <div class="nudge-bar">
+                                    <button class="btn-nudge" id="gl-start-step-back-10">◄◄</button>
+                                    <button class="btn-nudge" id="gl-start-step-back-1">◄</button>
+                                    <input type="range" class="control-slider" id="gl-start-slider" min="0" max="100"
+                                        value="10">
+                                    <button class="btn-nudge" id="gl-start-step-fwd-1">►</button>
+                                    <button class="btn-nudge" id="gl-start-step-fwd-10">►►</button>
+                                </div>
+                                <div class="control-feedback">
+                                    <span id="gl-start-idx-feedback">0 / 0</span>
+                                    <span id="gl-start-time-feedback">0.0000 s</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="control-row">
+                            <span class="control-label">GL.FIM</span>
+                            <div class="control-group">
+                                <div class="nudge-bar">
+                                    <button class="btn-nudge" id="gl-end-step-back-10">◄◄</button>
+                                    <button class="btn-nudge" id="gl-end-step-back-1">◄</button>
+                                    <input type="range" class="control-slider" id="gl-end-slider" min="0" max="100"
+                                        value="40">
+                                    <button class="btn-nudge" id="gl-end-step-fwd-1">►</button>
+                                    <button class="btn-nudge" id="gl-end-step-fwd-10">►►</button>
+                                </div>
+                                <div class="control-feedback">
+                                    <span id="gl-end-idx-feedback">0 / 0</span>
+                                    <span id="gl-end-time-feedback">0.0000 s</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="tangent-controls" style="display: none;">
+                        <div class="control-row">
+                            <span class="control-label">ÂNCORA</span>
+                            <div class="control-group">
+                                <div class="nudge-bar">
+                                    <button class="btn-nudge" id="anchor-step-back-10">◄◄</button>
+                                    <button class="btn-nudge" id="anchor-step-back-1">◄</button>
+                                    <input type="range" class="control-slider" id="anchor-slider" min="0" max="100"
+                                        value="35">
+                                    <button class="btn-nudge" id="anchor-step-fwd-1">►</button>
+                                    <button class="btn-nudge" id="anchor-step-fwd-10">►►</button>
+                                </div>
+                                <div class="control-feedback">
+                                    <span id="anchor-idx-feedback">0 / 0</span>
+                                    <span id="anchor-time-feedback">0.0000 s</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="apply-section">
+                        <span class="apply-title">Aplicar a:</span>
+                        <div class="apply-radios">
+                            <label class="radio-label">
+                                <input type="radio" name="apply-target" value="visible" id="target-visible" checked>
+                                Todos os visíveis
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="apply-target" value="custom" id="target-custom">
+                                Selecionar...
+                            </label>
+                        </div>
+
+                        <div class="custom-selection-box" id="custom-selection-box" style="display: none;">
+                            <div class="select-actions-bar">
+                                <button class="btn-text" id="btn-select-all">Marcar todos</button>
+                                <button class="btn-text" id="btn-deselect-all">Desmarcar todos</button>
+                            </div>
+                            <ul class="custom-sample-checklist" id="custom-sample-checklist"></ul>
+                        </div>
+                    </div>
+
+                    <div class="integration-warning" id="overlap-warning"></div>
+
+                    <div class="modal-footer">
+                        <button class="btn-modal btn-apply" id="btn-apply-integration">Aplicar</button>
+                        <button class="btn-modal btn-cancel" id="btn-cancel-integration">Cancelar</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Janela: remover picos de uma região (início/fim escolhidos no gráfico) -->
+            <div class="modal-forced-integration" id="remove-region-modal" style="display: none;">
+                <div class="modal-header" id="remove-region-drag-handle">
+                    <div class="modal-title">🧹 Remover picos da região</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="remove-region-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body">
+                    <div class="control-row">
+                        <span class="control-label">REGIÃO</span>
+                        <div class="region-range">
+                            <input type="number" step="0.001" id="region-t0" class="modal-input">
+                            <span>–</span>
+                            <input type="number" step="0.001" id="region-t1" class="modal-input">
+                            <span class="region-unit">min</span>
+                        </div>
+                    </div>
+
+                    <div class="apply-section">
+                        <span class="apply-title">Remover das corridas:</span>
+                        <div class="select-actions-bar">
+                            <button class="btn-text" id="region-select-all">Marcar todas</button>
+                            <button class="btn-text" id="region-select-none">Desmarcar todas</button>
+                        </div>
+                        <ul class="custom-sample-checklist region-run-list" id="region-run-list"></ul>
+                    </div>
+
+                    <div class="region-hint">Considera os picos cujo ápice está dentro da região.</div>
+
+                    <div class="modal-footer">
+                        <button class="btn-modal btn-danger" id="btn-confirm-region-remove">Remover</button>
+                        <button class="btn-modal btn-cancel" id="btn-cancel-region-remove">Cancelar</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Janela: cromatograma de íon extraído (GC-MS) -->
+            <div class="modal-forced-integration" id="eic-modal" style="display: none;">
+                <div class="modal-header" id="eic-drag-handle">
+                    <div class="modal-title">📉 Íon extraído (EIC)</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="eic-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body">
+                    <div class="control-row">
+                        <span class="control-label">m/z</span>
+                        <input type="text" id="eic-ions" class="modal-input" placeholder="ex.: 43, 57, 91"
+                            autocomplete="off">
+                    </div>
+                    <div class="control-row">
+                        <span class="control-label">TOL. ±</span>
+                        <div class="region-range">
+                            <input type="number" id="eic-tol" class="modal-input" min="0.01" max="5" step="0.1"
+                                value="0.5">
+                            <span class="region-unit">Da</span>
+                        </div>
+                    </div>
+                    <label class="check-item"><input type="checkbox" id="eic-show-tic"> Mostrar o TIC ao fundo (escala
+                        ajustada)</label>
+                    <div class="region-hint">Até 8 íons. Dica: clique numa barra do espectro para adicionar ou remover o
+                        íon.</div>
+
+                    <div class="modal-footer">
+                        <button class="btn-modal btn-apply" id="btn-eic-apply">Aplicar</button>
+                        <button class="btn-modal btn-cancel" id="btn-eic-clear">Limpar EIC</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Janela: alinhar (tempo) e normalizar (intensidade) as corridas -->
+            <div class="modal-forced-integration align-modal" id="align-modal" style="display: none;">
+                <div class="modal-header" id="align-drag-handle">
+                    <div class="modal-title">⇄ Alinhar e normalizar corridas</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="align-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body">
+                    <div class="ms-mode-tabs align-tabs">
+                        <button class="ms-mode-tab active" data-aligntab="align">Alinhar tempo</button>
+                        <button class="ms-mode-tab" data-aligntab="norm">Normalizar</button>
+                    </div>
+
+                    <div id="align-pane-align" class="align-pane">
+                        <div class="control-row">
+                            <span class="control-label">REFER.</span>
+                            <select id="align-ref" class="ms-select align-grow"></select>
+                        </div>
+                        <div class="control-row">
+                            <span class="control-label">ÂNCORA</span>
+                            <div class="region-range">
+                                <input type="number" step="0.001" id="align-anchor" class="modal-input"
+                                    placeholder="tR (min)">
+                                <span class="region-unit">±</span>
+                                <input type="number" step="0.01" min="0.005" id="align-win" class="modal-input"
+                                    value="0.1">
+                                <button class="ms-bg-btn" id="align-pick"
+                                    title="Clicar no pico âncora no cromatograma">Gráfico</button>
+                            </div>
+                        </div>
+                        <div class="align-table-wrap">
+                            <table class="align-table">
+                                <thead>
+                                    <tr>
+                                        <th></th>
+                                        <th>Corrida</th>
+                                        <th>tR (min)</th>
+                                        <th>Δ (min)</th>
+                                        <th>Desloc.</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="align-rows"></tbody>
+                            </table>
+                        </div>
+                        <div class="region-hint">Cada corrida é deslocada para que o pico âncora fique no mesmo tR da
+                            referência.
+                            Só o eixo do tempo muda (as áreas não); picos já integrados acompanham. O histórico de
+                            desfazer é zerado.</div>
+                        <div class="modal-footer">
+                            <button class="btn-modal btn-apply" id="btn-align-apply">Aplicar alinhamento</button>
+                            <button class="btn-modal btn-cancel" id="btn-align-revert"
+                                title="Volta todas as corridas ao tempo original">Reverter tudo</button>
+                        </div>
+                    </div>
+
+                    <div id="align-pane-norm" class="align-pane" style="display: none;">
+                        <div class="control-row">
+                            <span class="control-label">MODO</span>
+                            <select id="norm-mode" class="ms-select align-grow">
+                                <option value="none">Nenhuma</option>
+                                <option value="is">Padrão interno (um pico em cada corrida)</option>
+                                <option value="manual">Fator manual por corrida</option>
+                            </select>
+                        </div>
+                        <div class="control-row" id="norm-is-row">
+                            <span class="control-label">PADRÃO</span>
+                            <select id="norm-is" class="ms-select align-grow"></select>
+                        </div>
+                        <div class="control-row" id="norm-metric-row">
+                            <span class="control-label">USAR</span>
+                            <select id="norm-metric" class="ms-select align-grow">
+                                <option value="area">Área</option>
+                                <option value="height">Altura</option>
+                            </select>
+                        </div>
+                        <div class="align-table-wrap">
+                            <table class="align-table" id="norm-table">
+                                <thead>
+                                    <tr>
+                                        <th>Corrida</th>
+                                        <th id="norm-th-std">Padrão</th>
+                                        <th>Fator</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="norm-rows"></tbody>
+                            </table>
+                        </div>
+                        <label class="check-item"><input type="checkbox" id="norm-plot"> Aplicar também ao cromatograma
+                            (escala de exibição)</label>
+                        <div class="region-hint" id="norm-hint"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Janela: método de compostos (lista reutilizável) e matriz compostos × corridas -->
+            <div class="modal-forced-integration compounds-modal" id="compounds-modal" style="display: none;">
+                <div class="modal-header" id="compounds-drag-handle">
+                    <div class="modal-title">🧪 Compostos</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="compounds-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body">
+                    <div class="ms-mode-tabs align-tabs">
+                        <button class="ms-mode-tab active" data-cmptab="list">Lista</button>
+                        <button class="ms-mode-tab" data-cmptab="matrix">Matriz</button>
+                    </div>
+
+                    <div id="cmp-pane-list" class="align-pane">
+                        <div class="align-table-wrap">
+                            <table class="align-table cmp-table">
+                                <thead>
+                                    <tr>
+                                        <th>Composto</th>
+                                        <th title="Tempo de retenção esperado (min)">tR</th>
+                                        <th title="Janela de busca ± (min)">±</th>
+                                        <th>Baseline</th>
+                                        <th id="cmp-th-ion" title="m/z do EIC deste composto (vazio = TIC)">m/z</th>
+                                        <th title="Padrão interno (uma marcação por modo)">PI</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="cmp-rows"></tbody>
+                            </table>
+                        </div>
+                        <div class="cmp-actions">
+                            <button class="ms-bg-btn" id="cmp-add">+ Composto</button>
+                            <button class="ms-bg-btn" id="cmp-from-peaks"
+                                title="Cria um composto para cada nome de pico já integrado">Criar dos picos</button>
+                            <label class="cmp-snr" title="Relação sinal/ruído mínima para aceitar um pico">S/N mín.
+                                <input type="number" id="cmp-snr" value="3" min="0" step="0.5"></label>
+                        </div>
+                        <div class="region-hint">Para cada composto e corrida: se já existe um pico integrado na janela,
+                            ele é
+                            reaproveitado (e recebe o nome do composto); senão o programa procura o pico, define os
+                            limites
+                            no vale e integra. Faça o alinhamento (⇄) antes, se os tR variam entre as corridas.</div>
+                        <div class="modal-footer">
+                            <button class="btn-modal btn-apply" id="cmp-apply">Aplicar às corridas</button>
+                            <button class="btn-modal btn-cancel" id="cmp-clear-peaks"
+                                title="Remove os picos criados/identificados por compostos">Limpar resultados</button>
+                        </div>
+                    </div>
+
+                    <div id="cmp-pane-matrix" class="align-pane" style="display: none;">
+                        <div class="control-row">
+                            <span class="control-label">VALOR</span>
+                            <select id="cmp-metric" class="ms-select align-grow">
+                                <option value="area">Área</option>
+                                <option value="height">Altura</option>
+                                <option value="rt">tR (min)</option>
+                                <option value="pct">% da área (entre os compostos)</option>
+                                <option value="ratio">Área ÷ padrão interno</option>
+                            </select>
+                        </div>
+                        <div class="align-table-wrap cmp-matrix-wrap">
+                            <table class="align-table" id="cmp-matrix">
+                                <thead id="cmp-matrix-head"></thead>
+                                <tbody id="cmp-matrix-body"></tbody>
+                            </table>
+                        </div>
+                        <div class="region-hint">n.d. = não detectado nesta corrida. Valores com todas as casas decimais
+                            no CSV.</div>
+                        <div class="modal-footer">
+                            <button class="btn-modal btn-apply" id="cmp-export-csv">📥 Exportar CSV</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Janela: referência e biblioteca MSP para comparar espectros (GC-MS) -->
+            <div class="modal-forced-integration specref-modal" id="specref-modal" style="display: none;">
+                <div class="modal-header" id="specref-drag-handle">
+                    <div class="modal-title">⇆ Comparar espectros</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="specref-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+
+                <div class="modal-body">
+                    <div class="control-row">
+                        <span class="control-label">REF.</span>
+                        <div id="ref-info" class="ref-info">Nenhuma referência</div>
+                    </div>
+                    <div class="cmp-actions">
+                        <button class="ms-bg-btn" id="ref-set-current"
+                            title="Guarda o espectro exibido (scan ou média) como referência">Fixar o espectro
+                            atual</button>
+                        <button class="ms-bg-btn" id="ref-clear">Remover referência</button>
+                    </div>
+
+                    <div class="control-row">
+                        <span class="control-label">BIBLIO.</span>
+                        <select id="lib-select" class="ms-select align-grow"></select>
+                        <button class="ms-bg-btn" id="lib-upload-btn" title="Carregar uma biblioteca em formato MSP">📂
+                            .msp</button>
+                        <input type="file" id="lib-file" accept=".msp,.txt" multiple style="display: none;">
+                    </div>
+                    <div class="cmp-actions">
+                        <button class="ms-bg-btn" id="lib-search"
+                            title="Procura na biblioteca os espectros mais parecidos com o exibido">Buscar o espectro
+                            atual</button>
+                        <input type="text" id="lib-name-q" class="modal-input specref-q"
+                            placeholder="ou procurar por nome" autocomplete="off">
+                        <button class="ms-bg-btn" id="lib-find">Procurar</button>
+                    </div>
+                    <div class="align-table-wrap">
+                        <table class="align-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Composto</th>
+                                    <th title="Nota direta 0–999">MF</th>
+                                    <th title="Nota reversa 0–999 (só os íons da referência)">RMF</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="lib-results"></tbody>
+                        </table>
+                    </div>
+                    <div class="region-hint">MF/RMF: semelhança de 0 a 999 (cosseno com pesos m/z³ · intensidade⁰·⁶,
+                        como na busca do NIST),
+                        calculada em massa nominal. A reversa ignora íons extras do seu espectro (contaminantes).</div>
+                </div>
+            </div>
+
+            <!-- Modal do Bloco de Notas -->
+            <div class="floating-modal" id="notes-modal" style="display: none; width: 360px;">
+                <div class="modal-header" id="notes-drag-handle">
+                    <div class="modal-title">📝 Bloco de Notas</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="notes-minimize-btn" title="Minimizar">_</button>
+                        <button class="modal-icon-btn" id="notes-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+                <div class="modal-body" id="notes-body-content"
+                    style="padding: 10px; display: flex; flex-direction: column; gap: 8px;">
+                    <textarea id="project-notes-input" class="notes-textarea"
+                        placeholder="Escreva anotações sobre o projeto, parâmetros da corrida, amostras ou observações... (salvo com o projeto)"></textarea>
+                    <div class="notes-footer-info">
+                        <span>💾 Salvo automaticamente com o projeto</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal de Rampas de Temperatura -->
+            <div class="floating-modal" id="temp-ramp-modal" style="display: none; width: 440px;">
+                <div class="modal-header" id="temp-ramp-drag-handle">
+                    <div class="modal-title">🌡️ Programa de Temperatura (Forno)</div>
+                    <div class="modal-header-actions">
+                        <button class="modal-icon-btn" id="temp-ramp-minimize-btn" title="Minimizar">_</button>
+                        <button class="modal-icon-btn" id="temp-ramp-close-btn" title="Fechar">✕</button>
+                    </div>
+                </div>
+                <div class="modal-body" id="temp-ramp-body-content"
+                    style="padding: 12px; display: flex; flex-direction: column; gap: 10px;">
+                    <!-- Seletor e Ações da Rampa -->
+                    <div class="ramp-selector-bar">
+                        <div class="ramp-select-wrapper">
+                            <label class="ramp-label">Rampa:</label>
+                            <select id="ramp-select" class="modal-select" style="flex: 1;"></select>
+                        </div>
+                        <div class="ramp-actions-bar">
+                            <button id="btn-add-ramp" class="btn-text-sm" title="Adicionar nova rampa">+ Nova</button>
+                            <button id="btn-del-ramp" class="btn-text-sm danger"
+                                title="Excluir rampa selecionada">Excluir</button>
+                        </div>
+                    </div>
+
+                    <!-- Configuração da Rampa Atual -->
+                    <div class="ramp-config-row">
+                        <div class="ramp-name-field">
+                            <label class="ramp-label">Nome:</label>
+                            <input type="text" id="ramp-name-input" class="modal-input" placeholder="Nome da rampa"
+                                style="height: 28px; font-size: 0.82rem;">
+                        </div>
+                        <label class="ramp-checkbox-label" title="Exibir rampa como linha pontilhada no gráfico">
+                            <input type="checkbox" id="ramp-visible-checkbox" checked>
+                            <span>Exibir no gráfico</span>
+                        </label>
+                    </div>
+
+                    <!-- Tabela de Estágios -->
+                    <div class="ramp-table-container">
+                        <table class="ramp-stages-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 25px;">#</th>
+                                    <th>Taxa (°C/min)</th>
+                                    <th>Temp (°C)</th>
+                                    <th>Hold (min)</th>
+                                    <th style="width: 28px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="ramp-stages-body">
+                                <!-- Preenchido dinamicamente via JS -->
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+                        <button id="btn-add-stage" class="btn-text-sm">+ Adicionar Estágio</button>
+                        <div id="ramp-summary-info" class="ramp-summary-text">Tempo Total: 0.0 min</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Gaveta Inferior de Resultados -->
+            <div class="bottom-results-panel" id="bottom-panel" style="display: none;">
+                <div class="panel-resizer" id="panel-resizer"></div>
+                <div class="bottom-panel-header">
+                    <div class="tab-list" id="panel-tab-list"></div>
+
+                    <div class="panel-header-right">
+                        <button class="btn-remove-peaks" id="btn-remove-peaks"
+                            title="Remove os picos marcados; sem marcação, remove todos os da guia ativa">🗑 Remover
+                            todos</button>
+
+                        <button class="btn-export-csv" id="btn-export-table-csv"
+                            title="Exportar dados da guia ativa com precisão total">
+                            📥 Exportar
+                        </button>
+
+                        <button class="panel-icon-btn active" id="btn-toggle-shading"
+                            title="Ocultar/Exibir Sombras e Linhas de Base">🎨</button>
+                        <button class="panel-icon-btn active" id="btn-toggle-labels"
+                            title="Ocultar/Exibir Nomes nos Picos">🏷️</button>
+
+                        <button class="panel-toggle-btn" id="panel-minimize-btn" title="Minimizar">_</button>
+                        <button class="panel-toggle-btn danger" id="panel-close-btn" title="Fechar Gaveta">✕</button>
+                    </div>
+                </div>
+                <div class="bottom-panel-body" id="bottom-panel-body">
+                    <table class="peaks-table">
+                        <thead>
+                            <tr id="table-header-row">
+                                <th style="width: 28px;"><input type="checkbox" id="peaks-select-all"
+                                        title="Marcar/desmarcar todos desta guia"></th>
+                                <th style="width: 40px;">#</th>
+                                <th>Amostra</th>
+                                <th>Nome</th>
+                                <th>tR (min)</th>
+                                <th>Área (u.a.·s)</th>
+                                <th>Altura</th>
+                                <th id="th-norm" style="display: none;">Norm.</th>
+                                <th id="th-area-pct">% Área</th>
+                                <th>Baseline</th>
+                                <th style="width: 35px;"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="peaks-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Gaveta inferior do GC-MS: espectro de massas (fragmentação) do scan selecionado -->
+            <div class="bottom-results-panel ms-panel" id="ms-panel" style="display: none;">
+                <div class="panel-resizer" id="ms-panel-resizer"></div>
+                <div class="bottom-panel-header">
+                    <div class="ms-mode-tabs" id="ms-mode-tabs" style="display: none;">
+                        <button class="ms-mode-tab active" data-msmode="scan">Scan</button>
+                        <button class="ms-mode-tab" data-msmode="avg">Média</button>
+                        <button class="ms-mode-tab" data-msmode="cmp" style="display: none;">Comparar</button>
+                    </div>
+                    <div class="ms-panel-title" id="ms-title">Espectro de massas</div>
+
+                    <div class="panel-header-right">
+                        <div class="ms-avg-controls" id="ms-avg-controls" style="display: none;">
+                            <select class="ms-select" id="ms-bin-select"
+                                title="Alinhamento de m/z: massas próximas são agrupadas em bins desta largura (1 = massa nominal)">
+                                <option value="1">bin 1</option>
+                                <option value="0.5">bin 0,5</option>
+                                <option value="0.1">bin 0,1</option>
+                                <option value="0.01">bin 0,01</option>
+                            </select>
+                            <button class="ms-bg-btn" id="ms-bg-btn"
+                                title="Escolher no cromatograma a região de fundo (início e fim)">Fundo…</button>
+                            <button class="ms-bg-btn active" id="ms-bg-toggle" style="display: none;"
+                                title="Subtrair / não subtrair o fundo">− fundo</button>
+                        </div>
+                        <div class="ms-nav" id="ms-nav" title="Setas ← → do teclado também navegam (Shift = ±10)">
+                            <button class="panel-icon-btn" id="ms-step-back-10" title="10 scans para trás">◄◄</button>
+                            <button class="panel-icon-btn" id="ms-step-back-1" title="Scan anterior (←)">◄</button>
+                            <button class="panel-icon-btn" id="ms-step-fwd-1" title="Próximo scan (→)">►</button>
+                            <button class="panel-icon-btn" id="ms-step-fwd-10" title="10 scans para frente">►►</button>
+                        </div>
+                        <button class="panel-icon-btn" id="ms-labels-btn"
+                            title="Densidade dos rótulos de m/z (clique para alternar)">🏷</button>
+                        <button class="panel-icon-btn ms-rel-btn active" id="ms-rel-btn"
+                            title="Alternar abundância relativa (%) / absoluta">%</button>
+                        <button class="ms-bg-btn" id="ms-ref-btn"
+                            title="Comparar com um espectro de referência ou buscar em uma biblioteca MSP">⇆
+                            Ref.</button>
+                        <button class="btn-export-csv" id="ms-export-btn"
+                            title="Exportar o espectro exibido em CSV (m/z; intensidade)">📥 CSV</button>
+                        <button class="btn-export-csv" id="ms-export-msp-btn"
+                            title="Exportar o espectro exibido em MSP (biblioteca NIST / busca espectral)">📥
+                            MSP</button>
+                        <button class="panel-toggle-btn" id="ms-minimize-btn" title="Minimizar">_</button>
+                    </div>
+                </div>
+                <div class="bottom-panel-body ms-panel-body">
+                    <div id="ms-spectrum"></div>
+                    <div class="ms-empty-msg" id="ms-empty-msg"></div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Barra Lateral Direita: DIRETÓRIO DE PROJETOS -->
+        <div class="resizer" id="right-resizer"></div>
+        <aside class="sidebar right-sidebar" id="right-sidebar">
+            <div class="right-sidebar-header">
+                <div class="right-sidebar-title">📁 Diretório de Projetos</div>
+                <button id="close-projects-btn" class="modal-icon-btn" title="Fechar Painel">»</button>
+            </div>
+
+            <!-- Caminho da Pasta e Alterar Diretório -->
+            <div class="directory-box">
+                <div class="dir-label">PASTA PADRÃO:</div>
+                <div class="dir-path-text" id="current-dir-display">Carregando...</div>
+                <button id="btn-change-directory" class="btn-dir-change">Alterar Pasta</button>
+            </div>
+
+            <!-- Ações do Projeto: 2 Fileiras (2x2) -->
+            <div class="project-actions-grid">
+                <button id="btn-save-project" class="btn btn-primary"
+                    title="Salvar alterações no projeto atual">Salvar</button>
+                <button id="btn-save-as-project" class="btn btn-ghost"
+                    title="Salvar com um novo nome no diretório">Salvar Como</button>
+                <button id="btn-load-external-project" class="btn btn-ghost"
+                    title="Importar arquivo .json do computador">Importar</button>
+                <button id="btn-close-project" class="btn btn-ghost danger"
+                    title="Fechar projeto atual e limpar visualização">Fechar</button>
+                <input type="file" id="external-project-input" accept=".json" hidden>
+            </div>
+
+            <!-- Lista de Projetos Salvos -->
+            <div class="projects-list-section">
+                <div class="sample-header">Projetos Salvos (<span id="projects-count">0</span>)</div>
+                <ul id="projects-list" class="projects-file-list"></ul>
+            </div>
+        </aside>
+
+        <script src="js/app.js"></script>
+</body>
+
+</html>
